@@ -47,6 +47,10 @@ const {
 } = globalThis.TabOutListOrder || {};
 
 const {
+  compressImageFileForStorage,
+} = globalThis.TabOutBackgroundImage || {};
+
+const {
   completeTodo,
   clearArchivedTodos,
   createTodo,
@@ -408,15 +412,6 @@ async function saveThemePreferences(nextPreferences) {
   applyThemePreferences();
   renderThemeMenu();
   return themePreferences;
-}
-
-function readFileAsDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(reader.error || new Error('Could not read file'));
-    reader.readAsDataURL(file);
-  });
 }
 
 function reorderVisibleItemsByIds(items, orderIds, includeItem) {
@@ -965,11 +960,6 @@ function previewDraggedOrder(clientX) {
   if (!navListEl || !draggedGroupId) return;
 
   const placeholder = ensureDragPlaceholder();
-  const previousNavRects = new Map();
-  navListEl.querySelectorAll('.group-nav-button:not(.is-dragging)').forEach(button => {
-    previousNavRects.set(button.dataset.groupId || '', button.getBoundingClientRect());
-  });
-
   const buttons = [...navListEl.querySelectorAll('.group-nav-button:not(.is-dragging)')];
   let insertBeforeButton = null;
 
@@ -986,8 +976,6 @@ function previewDraggedOrder(clientX) {
   } else {
     navListEl.appendChild(placeholder);
   }
-
-  animateNavButtons(navListEl, previousNavRects);
 
   const previewOrderKeys = [...navListEl.children]
     .map(node => {
@@ -3530,7 +3518,10 @@ document.addEventListener('change', async (e) => {
   if (!file) return;
 
   try {
-    const customBackground = await readFileAsDataUrl(file);
+    if (!compressImageFileForStorage) {
+      throw new Error('Background compression is unavailable');
+    }
+    const customBackground = await compressImageFileForStorage(file);
     await saveThemePreferences({ customBackground });
     themeMenuOpen = false;
     renderThemeMenu();

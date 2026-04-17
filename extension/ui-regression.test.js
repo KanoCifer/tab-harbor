@@ -232,6 +232,9 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.action-btn\.close-tabs:hover\s*\{[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border-color:\s*var\(--workspace-accent-border\);/);
   assert.match(css, /\.deferred-shell\s*\{[\s\S]*var\(--panel-surface-opacity\)/);
   assert.match(css, /\.todo-detail-card\s*\{[\s\S]*var\(--panel-card-opacity\)/);
+  assert.match(appJs, /compressImageFileForStorage/);
+  assert.doesNotMatch(appJs, /readFileAsDataUrl/);
+  assert.match(html, /<script src="background-image\.js"><\/script>/);
 });
 
 test('quick tabs area renders shortcut cards and add button hooks', () => {

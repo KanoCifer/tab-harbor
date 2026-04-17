@@ -2,49 +2,73 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**A new tab dashboard for organizing open tabs, quick links, todos, and saved reads in one calm workspace.**
+**A calmer Chrome new tab dashboard for open tabs, quick links, saved reads, and lightweight todos.**
 
-Tab Harbor turns Chrome's new tab page into something you can actually work from. Instead of opening one more empty tab and immediately getting lost again, you land in a quiet dashboard that shows what is already open, what should be saved for later, and what still needs your attention.
+Tab Harbor turns Chrome's new tab page into a place where you can keep working. You immediately see what is already open, which pages should be moved into read-later, and what still needs your attention.
 
-It is built for the kind of browsing that turns into research, shipping, side quests, and thirty tabs you swear are all still useful.
+<p align="center">
+  <img src="assets/readme/feature-tabs.png" alt="Tab Harbor overview" width="760">
+</p>
 
-## ✨ Preview
+## ✨ Core Highlights
 
-Here is the main dashboard view, with open tabs grouped into readable stacks instead of one endless strip.
+- **Tabs are automatically organized by domain.** Tab Harbor groups open pages by domain, and moves homepage-style tabs into a dedicated `Homepages` group, so you can quickly see what you are actually working on.
+- **You can still organize things around your own workflow.** When domain-based grouping is not enough, you can create manual groups, keep common quick links around, and jump back to the right section from the top icon rail.
+- **Read later and todos move into the drawer, separate from the main workspace, without needing another app.** You can search, restore, or archive them later instead of leaving everything hanging in the browser tab bar.
+- **It is not just a tab-cleaning tool.** Quick links, todos, open tabs, and saved reads all live in the same new tab page, so the next thing you need is usually right in front of you.
+- **It tries to make the workspace calmer without making the system heavier.** You can switch themes, tune transparency, set a custom background, and clean duplicate tabs with one click, while everything still stays in `chrome.storage.local` with no backend or account.
 
-![Tab Harbor overview](assets/readme/overview.png)
+## 🖼️ Feature Tour
 
-And here is the side drawer for saved reads, where pages can sit for later without getting buried forever.
+<table>
+  <tr>
+    <td width="33.33%" valign="top">
+      <strong>Unified tab management</strong><br><br>
+      <img src="assets/readme/feature-tabs.png" alt="Tabs" width="100%">
+    </td>
+    <td width="33.33%" valign="top">
+      <strong>Saved reads</strong><br><br>
+      <img src="assets/readme/feature-saved-drawer.png" alt="Saved reads drawer" width="100%">
+    </td>
+    <td width="33.33%" valign="top">
+      <strong>Todos and quick jumping</strong><br><br>
+      <img src="assets/readme/feature-todos.png" alt="Todos" width="100%">
+    </td>
+  </tr>
+</table>
 
-![Tab Harbor drawer](assets/readme/drawer.png)
+### Unified tab management
 
-## 🌊 Why Tab Harbor
+Tab Harbor organizes tabs more like a workspace: **domain-based groups, manual groups, quick access links, and fast jumping from the top icon rail**. If you want to clean up the browser a bit more, you can **also remove duplicate tabs with one click**.
 
-Most new tab pages try to be a search box, a wallpaper, or a speed dial. Tab Harbor is closer to a lightweight control room. It keeps the messy reality of browsing visible, but turns it into something calmer: domains are grouped, homepage tabs are pulled into their own space, duplicates are easy to spot, and the “I need this, just not right now” pages finally have a home.
+### Saved reads
 
-It also goes beyond tab cleanup. You can keep a row of quick links for the pages you open constantly, manage a small todo list without leaving the tab page, and build a read-later queue that feels closer to a working inbox than a pile of forgotten bookmarks.
+Pages that are not for right now can be **moved into the side drawer, then searched, restored, or archived later**, instead of living forever in the browser tab bar.
 
-## 🧭 Features
+### Todos and quick jumping
 
-- Group open tabs by domain so related pages stay together automatically
-- Pull homepage tabs like GitHub, YouTube, LinkedIn, X, and similar entry pages into a dedicated Homepages group
-- Jump to any open tab directly from the dashboard without opening duplicates
-- Detect duplicate pages and clean them up with one click
-- Detect duplicate Tab Harbor tabs and close the extras from the top banner
-- Save pages for later before closing them, then revisit them from the side drawer
-- Archive saved pages after you are done with them
-- Search saved pages and archived items from inside the drawer
-- Create and manage todos directly from the new tab page
-- Archive completed todos while keeping active work visible
-- Search todos and open a simple detail view for longer notes
-- Add quick links for the pages you open all the time
-- Show localhost tabs with port numbers so local projects are easier to tell apart
-- Expand large groups without losing the clean overview
-- Create manual groups and move tabs into them when domain-based grouping is not enough
-- Reorder groups from the top nav so your workflow stays in the order you want
-- Reorder saved pages and todos inside the drawer
-- Switch themes, change transparency, and use a custom background image
-- Keep everything local with no server, no account, and no external API dependency
+Tab Harbor also works as a tiny action layer: jot down todos, keep short descriptions, archive completed items, and jump back into the right group from the same page.
+
+### Theme switching
+
+When you want the page to feel more like your own workspace, you can **switch themes, tune transparency, and use a custom background image**.
+
+<table>
+  <tr>
+    <td><img src="assets/readme/theme-warm-neutral.png" alt="warm neutral" width="100%"></td>
+    <td><img src="assets/readme/theme-soft-green.png" alt="soft green" width="100%"></td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/theme-soft-clay.png" alt="soft clay" width="100%"></td>
+    <td><img src="assets/readme/theme-custom-background.png" alt="custom background" width="100%"></td>
+  </tr>
+</table>
+
+## 🌊 Why It Feels Different
+
+Most new tab pages try to be a search box, a wallpaper, or a speed dial. Tab Harbor is closer to a lightweight browser control room. It keeps the messy reality of browsing visible, but turns it into something calmer and more actionable.
+
+That also means it is intentionally lightweight. There is no backend, no sync account, and no extra app to open. It lives exactly where the browsing chaos already happens.
 
 ## ⚡ Quick Use
 
@@ -73,24 +97,21 @@ It also goes beyond tab cleanup. You can keep a row of quick links for the pages
 5. Select the [`extension/`](extension/) folder
 6. Open a new tab
 
-## 🪴 What It Feels Like
-
-A good session in Tab Harbor feels less like “tab management” and more like having your browser desk cleaned up just enough to think again. Your working tabs stay visible, your future-reading pile moves to the side instead of disappearing, and the next action is usually one click away.
-
-That is also why the extension tries to stay lightweight. There is no sync story to set up, no backend to trust, and no extra app to open. It lives where the mess already happens.
-
 ## 🔒 Fully Local
 
-Tab Harbor runs entirely inside the extension. Open tabs are read directly from Chrome, and your saved pages, todos, quick links, theme settings, and layout preferences stay on your machine through `chrome.storage.local`.
+Tab Harbor runs entirely inside the extension. Open tabs come directly from Chrome, and saved reads, todos, quick links, theme preferences, and layout state stay on your machine through `chrome.storage.local`.
 
 If you publish this repo for other people, they get the code and assets, not your personal browsing data.
 
 ## 🛠️ Under the Hood
 
-This is a Manifest V3 Chrome extension with a plain frontend stack and no build step required to use it. The interface is driven by browser APIs, local storage, and a small amount of animation polish for actions like cleanup and closing flows.
+This is a Manifest V3 Chrome extension with a plain frontend stack and no build step required to use it. You can clone it, load it, and start using it without npm, without a dev server, and without standing up anything else.
 
-That means you can clone it, load it, and start using it without npm, without a dev server, and without standing up anything else.
+## 🙏 Acknowledgements
+
+- Tab Harbor is built on top of Zara's open-source project [tab-out](https://github.com/zarazhangrui/tab-out), which is the upstream repository and the starting point for this project.
+- Thanks as well to the [Linux.do community](https://linux.do) for the ideas, feedback, and the kind of maker energy that helps projects like this keep evolving.
 
 ## 📄 License
 
-MIT.
+MIT License
