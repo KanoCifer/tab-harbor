@@ -130,14 +130,8 @@ function showToast(message) {
   setTimeout(() => toast.classList.remove('visible'), 2500);
 }
 
-function checkAndShowEmptyState() {
-  const missionsEl = document.getElementById('openTabsMissions');
-  if (!missionsEl) return;
-
-  const remaining = missionsEl.querySelectorAll('.mission-card:not(.closing)').length;
-  if (remaining > 0) return;
-
-  missionsEl.innerHTML = `
+function renderMissionsEmptyState() {
+  return `
     <div class="missions-empty-state">
       <div class="empty-checkmark">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
@@ -148,6 +142,16 @@ function checkAndShowEmptyState() {
       <div class="empty-subtitle">You're free.</div>
     </div>
   `;
+}
+
+function checkAndShowEmptyState() {
+  const missionsEl = document.getElementById('openTabsMissions');
+  if (!missionsEl) return;
+
+  const remaining = missionsEl.querySelectorAll('.mission-card:not(.closing)').length;
+  if (remaining > 0) return;
+
+  missionsEl.innerHTML = renderMissionsEmptyState();
 
   const countEl = document.getElementById('openTabsSectionCount');
   if (countEl) countEl.textContent = '0 domains';
