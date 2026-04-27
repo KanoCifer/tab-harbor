@@ -1364,8 +1364,10 @@ async function renderStaticDashboard() {
     const summary = runtimeT
       ? runtimeT('sectionSummary', { tabs: realTabs.length, groups: domainGroups.length, tabsWord, groupsWord })
       : `${realTabs.length} ${tabsWord} across ${domainGroups.length} ${groupsWord}`;
-    openTabsSectionCount.innerHTML = `<span class="section-summary">${summary}</span><button class="action-btn close-tabs section-action" type="button" data-action="close-all-open-tabs">${ICONS.close} ${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}</button>`;
-    openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    if (openTabsSectionCount) {
+      openTabsSectionCount.innerHTML = `<span class="section-summary">${summary}</span><button class="action-btn close-tabs section-action" type="button" data-action="close-all-open-tabs">${ICONS.close} ${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}</button>`;
+    }
+    if (openTabsMissionsEl) openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
     if (openTabsGroupNav) {
       openTabsGroupNav.innerHTML = renderGroupNavArea(domainGroups);
       openTabsGroupNav.style.display = 'flex';
@@ -1376,7 +1378,9 @@ async function renderStaticDashboard() {
       openTabsGroupNav.innerHTML = '';
       openTabsGroupNav.style.display = 'none';
     }
-    openTabsSection.style.display = 'none';
+    openTabsSection.style.display = 'block';
+    if (openTabsMissionsEl) openTabsMissionsEl.innerHTML = renderMissionsEmptyState();
+    if (openTabsSectionCount) openTabsSectionCount.textContent = runtimeT ? runtimeT('emptyTabsCount') : '0 domains';
   }
 
   // --- Footer stats ---
