@@ -3,7 +3,7 @@
 (function attachChromeTabGroups(globalScope) {
 
   const STORAGE_KEY = 'chromeTabGroupsEnabled';
-  const MAP_PERSIST_KEY = 'chromeTabGroupsMap';
+  const META_PERSIST_KEY = 'chromeTabGroupsMeta';
 
   let cachedEnabled = false;
   let chromeGroupMap = {};
@@ -47,16 +47,45 @@
 
   async function persistChromeGroupMap() {
     try {
-      await chrome.storage.local.set({ [MAP_PERSIST_KEY]: chromeGroupMap });
+      // Save group metadata (title, color) instead of raw groupIds,
+      // since Chrome tab group IDs are only stable within a session.
+      const meta = {};
+      for (const [groupKey, windowMap] of Object.entries(chromeGroupMap)) {
+        for (const chromeGroupId of Object.values(windowMap)) {
+          try {
+            const group = await chrome.tabGroups.get(chromeGroupId);
+            if (group && !meta[groupKey]) {
+              meta[groupKey] = { title: group.title, color: group.color };
+            }
+          } catch {}
+        }
+      }
+      await chrome.storage.local.set({ [META_PERSIST_KEY]: meta });
     } catch {}
   }
 
   async function loadPersistedChromeGroupMap() {
     try {
-      const result = await chrome.storage.local.get(MAP_PERSIST_KEY);
-      if (result[MAP_PERSIST_KEY]) {
-        chromeGroupMap = result[MAP_PERSIST_KEY];
+      const result = await chrome.storage.local.get(META_PERSIST_KEY);
+      const meta = result[META_PERSIST_KEY];
+      if (!meta || Object.keys(meta).length === 0) return;
+
+      const currentGroups = await chrome.tabGroups.query({});
+      const reconciled = {};
+
+      for (const [groupKey, info] of Object.entries(meta)) {
+        // Match by title + color — the values we control. After restart,
+        // Chrome assigns new groupIds, but our groups retain their title/color.
+        const match = currentGroups.find(g =>
+          g.title === info.title && g.color === info.color
+        );
+        if (match) {
+          if (!reconciled[groupKey]) reconciled[groupKey] = {};
+          reconciled[groupKey][match.windowId] = match.id;
+        }
       }
+
+      chromeGroupMap = reconciled;
     } catch {}
   }
 
@@ -212,7 +241,7 @@
     cachedEnabled = false;
     importMode = false;
     try {
-      await chrome.storage.local.remove(MAP_PERSIST_KEY);
+      await chrome.storage.local.remove(META_PERSIST_KEY);
     } catch {}
   }
 
