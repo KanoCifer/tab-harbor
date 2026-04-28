@@ -133,6 +133,12 @@
       chromeTabGroupsLabel: 'Chrome tab groups',
       toastChromeTabGroupsOn: 'Chrome tab groups on',
       toastChromeTabGroupsOff: 'Chrome tab groups off',
+      shortcutsLabel: 'Shortcuts',
+      popupShortcutsEmpty: 'No shortcuts yet.',
+      popupTabsEmpty: 'No tabs to display.',
+      ungroupedLabel: 'Ungrouped',
+      closeTabButton: 'Close',
+      popupRefreshLabel: 'Refresh popup content',
     },
     'zh-CN': {
       emptyTitle: '标签页清零了。',
@@ -241,6 +247,12 @@
       chromeTabGroupsLabel: 'Chrome 标签组',
       toastChromeTabGroupsOn: '已启用 同步Chrome标签组',
       toastChromeTabGroupsOff: '已禁用 同步Chrome标签组',
+      shortcutsLabel: '快捷方式',
+      popupShortcutsEmpty: '还没有快捷方式。',
+      popupTabsEmpty: '没有可显示的网页标签页。',
+      ungroupedLabel: '未分组',
+      closeTabButton: '关闭',
+      popupRefreshLabel: '刷新弹窗内容',
     },
   };
 
