@@ -51,6 +51,7 @@ const {
   loadChromeTabGroupsSetting,
   saveChromeTabGroupsSetting,
   syncChromeTabGroups,
+  collapseChromeTabGroupsInWindow,
   syncChromeTabGroupExpansionForTab,
   isChromeTabGroupsEnabled,
   populateChromeGroupMap,
@@ -362,6 +363,31 @@ function getOrderedUniqueTabsForGroup(group) {
     uniqueTabs.push(tab);
   }
   return reorderGroupTabsByStoredUrls(uniqueTabs, group?.domain);
+}
+
+function getTabsOrderedForChromeSync(group) {
+  const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
+  const orderUrls = groupTabOrderState[String(group?.domain)] || [];
+  if (!orderUrls.length) return tabs.slice();
+
+  const orderIndex = new Map(orderUrls.map((url, index) => [String(url), index]));
+  return tabs
+    .map((tab, originalIndex) => ({
+      tab,
+      originalIndex,
+      order: orderIndex.has(String(tab?.url || ''))
+        ? orderIndex.get(String(tab?.url || ''))
+        : Number.MAX_SAFE_INTEGER,
+    }))
+    .sort((a, b) => a.order - b.order || a.originalIndex - b.originalIndex)
+    .map(entry => entry.tab);
+}
+
+function getChromeSyncGroups(groups = domainGroups) {
+  return (Array.isArray(groups) ? groups : []).map(group => ({
+    ...group,
+    tabs: getTabsOrderedForChromeSync(group),
+  }));
 }
 
 /**
@@ -1768,8 +1794,34 @@ async function renderStaticDashboard() {
 async function renderDashboard() {
   await renderStaticDashboard();
   if (typeof syncChromeTabGroups === 'function') {
-    await syncChromeTabGroups(domainGroups);
+    await syncChromeTabGroups(getChromeSyncGroups(domainGroups));
   }
+}
+
+async function collapseChromeGroupsForCurrentTabHarborTab() {
+  if (typeof collapseChromeTabGroupsInWindow !== 'function') return;
+
+  let currentTab = null;
+  try {
+    currentTab = await chrome.tabs.getCurrent();
+  } catch {
+    currentTab = null;
+  }
+
+  if (!currentTab?.windowId) {
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      currentTab = activeTab || null;
+    } catch {
+      currentTab = null;
+    }
+  }
+
+  const extensionId = chrome.runtime.id;
+  const newtabUrl = `chrome-extension://${extensionId}/index.html`;
+  const isTabHarborTab = currentTab?.url === newtabUrl || currentTab?.url === 'chrome://newtab/';
+  if (!currentTab?.windowId || !isTabHarborTab) return;
+  await collapseChromeTabGroupsInWindow(currentTab.windowId);
 }
 
 function updateBackToTopVisibility() {
@@ -2572,6 +2624,9 @@ document.addEventListener('pointerup', async () => {
       if (draggedPageChipEl && pageChipPlaceholderEl) {
         pageChipDragState.listEl.insertBefore(draggedPageChipEl, pageChipPlaceholderEl);
       }
+      if (typeof syncChromeTabGroups === 'function') {
+        await syncChromeTabGroups(getChromeSyncGroups(domainGroups));
+      }
     }
 
     clearPageChipDragState();
@@ -2869,6 +2924,7 @@ async function initializeDashboardRuntime() {
   }
   ensureChromeTabGroupsSubscription();
   await renderDashboard();
+  await collapseChromeGroupsForCurrentTabHarborTab();
   updateBackToTopVisibility();
 
   // Listen for tab change notifications from background script
@@ -2920,6 +2976,14 @@ function setupTabChangeListener() {
 function mountDashboardRuntime() {
   if (!window.__tabHarborRuntimeMounted) {
     window.addEventListener('scroll', updateBackToTopVisibility, { passive: true });
+    window.addEventListener('focus', () => {
+      void collapseChromeGroupsForCurrentTabHarborTab();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        void collapseChromeGroupsForCurrentTabHarborTab();
+      }
+    });
     window.__tabHarborRuntimeMounted = true;
   }
   return initializeDashboardRuntime();

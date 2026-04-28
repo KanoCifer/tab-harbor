@@ -9,6 +9,7 @@ const popupI18n = globalThis.TabHarborI18n || {};
 
 const SESSION_GROUPS_KEY = 'sessionGroups';
 const GROUP_ORDER_KEY = 'groupOrder';
+const GROUP_TAB_ORDER_KEY = 'groupTabOrder';
 
 const popupState = {
   view: 'shortcuts',
@@ -17,6 +18,7 @@ const popupState = {
   tabGroups: [],
   sessionGroups: { groups: [], assignments: {} },
   groupOrder: { sessionOrder: [], pinnedOrder: [], pinEnabled: false },
+  groupTabOrder: {},
 };
 
 // Test exposure
@@ -37,10 +39,24 @@ globalThis._resetPopupState = () => {
   popupState.tabGroups = [];
   popupState.sessionGroups = { groups: [], assignments: {} };
   popupState.groupOrder = { sessionOrder: [], pinnedOrder: [], pinEnabled: false };
+  popupState.groupTabOrder = {};
   popupState.quickShortcuts = [];
 };
 globalThis._skipLoadPopupState = false;
 globalThis._popupIcons = popupIcons;
+
+const POPUP_REFRESH_KEYS = new Set([
+  'quickShortcuts',
+  'sessionGroups',
+  'groupOrder',
+  'groupTabOrder',
+  'themePreferences',
+  'languagePreference',
+]);
+
+let popupRefreshTimer = null;
+let popupRefreshInFlight = null;
+let popupRefreshQueued = false;
 
 function escapeAttr(value = '') {
   return popupIcons.escapeHtmlAttribute ? popupIcons.escapeHtmlAttribute(value) : String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -54,13 +70,102 @@ function friendlyDomain(domain) {
 }
 
 function stripTitleNoise(title) {
-  return String(title || '')
-    .replace(/\s*[|\-–—]\s*.*$/, '')
-    .trim();
+  if (!title) return '';
+  title = String(title);
+  title = title.replace(/^\(\d+\+?\)\s*/, '');
+  title = title.replace(/\s*\([\d,]+\+?\)\s*/g, ' ');
+  title = title.replace(/\s*[\-\u2010-\u2015]\s*[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
+  title = title.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
+  title = title.replace(/\s+on X:\s*/, ': ');
+  title = title.replace(/\s*\/\s*X\s*$/, '');
+  return title.trim();
+}
+
+function cleanTitle(title, hostname) {
+  if (!title || !hostname) return title || '';
+
+  const friendly = friendlyDomain(hostname);
+  const domain = hostname.replace(/^www\./, '');
+  const seps = [' - ', ' | ', ' — ', ' · ', ' – '];
+
+  for (const sep of seps) {
+    const idx = title.lastIndexOf(sep);
+    if (idx === -1) continue;
+    const suffix = title.slice(idx + sep.length).trim();
+    const suffixLow = suffix.toLowerCase();
+    if (
+      suffixLow === domain.toLowerCase() ||
+      suffixLow === friendly.toLowerCase() ||
+      suffixLow === domain.replace(/\.\w+$/, '').toLowerCase() ||
+      domain.toLowerCase().includes(suffixLow) ||
+      friendly.toLowerCase().includes(suffixLow)
+    ) {
+      const cleaned = title.slice(0, idx).trim();
+      if (cleaned.length >= 5) return cleaned;
+    }
+  }
+  return title;
+}
+
+function smartTitle(title, url) {
+  if (!url) return title || '';
+  let pathname = '';
+  let hostname = '';
+  try {
+    const parsed = new URL(url);
+    pathname = parsed.pathname;
+    hostname = parsed.hostname;
+  } catch {
+    return title || '';
+  }
+
+  const titleIsUrl = !title || title === url || title.startsWith(hostname) || title.startsWith('http');
+
+  if ((hostname === 'x.com' || hostname === 'twitter.com' || hostname === 'www.x.com') && pathname.includes('/status/')) {
+    const username = pathname.split('/')[1];
+    if (username) return titleIsUrl ? `Post by @${username}` : title;
+  }
+
+  if (hostname === 'github.com' || hostname === 'www.github.com') {
+    const parts = pathname.split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      const [owner, repo, ...rest] = parts;
+      if (rest[0] === 'issues' && rest[1]) return `${owner}/${repo} Issue #${rest[1]}`;
+      if (rest[0] === 'pull' && rest[1]) return `${owner}/${repo} PR #${rest[1]}`;
+      if (rest[0] === 'blob' || rest[0] === 'tree') return `${owner}/${repo} — ${rest.slice(2).join('/')}`;
+      if (titleIsUrl) return `${owner}/${repo}`;
+    }
+  }
+
+  if ((hostname === 'www.youtube.com' || hostname === 'youtube.com') && pathname === '/watch' && titleIsUrl) {
+    return 'YouTube Video';
+  }
+
+  if ((hostname === 'www.reddit.com' || hostname === 'reddit.com' || hostname === 'old.reddit.com') && pathname.includes('/comments/')) {
+    const parts = pathname.split('/').filter(Boolean);
+    const subIdx = parts.indexOf('r');
+    if (subIdx !== -1 && parts[subIdx + 1] && titleIsUrl) {
+      return `r/${parts[subIdx + 1]} post`;
+    }
+  }
+
+  return title || url;
+}
+
+function getTabHostname(tab) {
+  try {
+    if (tab?.url?.startsWith('file://')) return 'local-files';
+    return new URL(tab?.url || '').hostname || '';
+  } catch {
+    return '';
+  }
 }
 
 function getTabLabel(tab) {
-  const title = stripTitleNoise(tab.title || '');
+  const title = cleanTitle(
+    smartTitle(stripTitleNoise(tab.title || ''), tab.url || ''),
+    getTabHostname(tab)
+  );
   if (title) return title;
 
   try {
@@ -124,6 +229,71 @@ function matchCustomGroup(url) {
   } catch { return null; }
 }
 
+function normalizeGroupTabOrderState(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+
+  return Object.fromEntries(
+    Object.entries(input)
+      .map(([groupKey, orderIds]) => [
+        String(groupKey),
+        Array.isArray(orderIds)
+          ? [...new Set(orderIds.map(id => String(id)).filter(Boolean))]
+          : [],
+      ])
+      .filter(([, orderIds]) => orderIds.length > 0)
+  );
+}
+
+function reorderVisibleItemsByIds(items, orderIds, includeItem) {
+  if (!Array.isArray(items)) return [];
+  const list = items.slice();
+  const shouldInclude = typeof includeItem === 'function' ? includeItem : () => true;
+  const subset = list.filter(shouldInclude);
+  const normalizedOrder = Array.isArray(orderIds) ? orderIds.map(id => String(id)).filter(Boolean) : [];
+  if (!subset.length || subset.length !== normalizedOrder.length) return list;
+
+  const subsetMap = new Map(subset.map(item => [String(item.id), item]));
+  if (normalizedOrder.some(id => !subsetMap.has(id))) return list;
+
+  let nextIndex = 0;
+  return list.map(item => {
+    if (!shouldInclude(item)) return item;
+    const nextItem = subsetMap.get(normalizedOrder[nextIndex]);
+    nextIndex += 1;
+    return nextItem || item;
+  });
+}
+
+function reorderGroupTabsByStoredUrls(tabs, groupKey) {
+  const orderIds = popupState.groupTabOrder[String(groupKey)] || [];
+  if (!Array.isArray(tabs) || !tabs.length || !orderIds.length) return Array.isArray(tabs) ? tabs.slice() : [];
+
+  const wrappedTabs = tabs.map(tab => ({
+    id: String(tab?.url || ''),
+    tab,
+  }));
+  const subsetUrls = new Set(orderIds);
+  const reordered = reorderVisibleItemsByIds(
+    wrappedTabs,
+    orderIds,
+    item => subsetUrls.has(item.id)
+  );
+  return reordered.map(item => item.tab);
+}
+
+function getOrderedUniqueTabsForGroup(group) {
+  const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
+  const seen = new Set();
+  const uniqueTabs = [];
+  for (const tab of tabs) {
+    const url = String(tab?.url || '');
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    uniqueTabs.push(tab);
+  }
+  return reorderGroupTabsByStoredUrls(uniqueTabs, group?.domain);
+}
+
 async function loadPopupState() {
   if (globalThis._skipLoadPopupState) return;
   const shortcutsGetter = popupTheme.getQuickShortcuts;
@@ -131,11 +301,12 @@ async function loadPopupState() {
     popupState.quickShortcuts = await shortcutsGetter();
   }
 
-  const [tabs, tabGroups, sgResult, goResult] = await Promise.all([
+  const [tabs, tabGroups, sgResult, goResult, groupTabOrderResult] = await Promise.all([
     chrome.tabs.query({}),
     chrome.tabGroups.query({}),
     chrome.storage.local.get(SESSION_GROUPS_KEY),
     chrome.storage.local.get(GROUP_ORDER_KEY),
+    chrome.storage.local.get(GROUP_TAB_ORDER_KEY),
   ]);
 
   popupState.openTabs = filterTabs(tabs).map(tab => ({
@@ -165,13 +336,12 @@ async function loadPopupState() {
 
   const normalizeOrderFn = popupGroupOrder.normalizeGroupOrderState;
   popupState.groupOrder = normalizeOrderFn ? normalizeOrderFn(goResult[GROUP_ORDER_KEY]) : { sessionOrder: [], pinnedOrder: [], pinEnabled: false };
+  popupState.groupTabOrder = normalizeGroupTabOrderState(groupTabOrderResult[GROUP_TAB_ORDER_KEY]);
 }
 
 function buildPopupTabGroups() {
-  const { openTabs, tabGroups, sessionGroups, groupOrder } = popupState;
-  const usedTabIds = new Set();
+  const { openTabs, sessionGroups, groupOrder } = popupState;
 
-  // Session groups
   const sessionGroupMap = Object.fromEntries(
     sessionGroups.groups.map(group => [
       group.id,
@@ -179,24 +349,18 @@ function buildPopupTabGroups() {
     ])
   );
 
-  for (const tab of openTabs) {
-    const assignedGroupId = sessionGroups.assignments[String(tab.id)];
-    if (assignedGroupId && sessionGroupMap[assignedGroupId]) {
-      sessionGroupMap[assignedGroupId].tabs.push(tab);
-      usedTabIds.add(tab.id);
-    }
-  }
-
-  // Domain groups
   const groupMap = {};
   const landingTabs = [];
 
   for (const tab of openTabs) {
-    if (usedTabIds.has(tab.id)) continue;
+    const assignedGroupId = sessionGroups.assignments[String(tab.id)];
+    if (assignedGroupId && sessionGroupMap[assignedGroupId]) {
+      sessionGroupMap[assignedGroupId].tabs.push(tab);
+      continue;
+    }
 
     if (isLandingPage(tab.url)) {
       landingTabs.push(tab);
-      usedTabIds.add(tab.id);
       continue;
     }
 
@@ -205,7 +369,6 @@ function buildPopupTabGroups() {
       const key = customRule.groupKey;
       if (!groupMap[key]) groupMap[key] = { domain: key, label: customRule.groupLabel, tabs: [], kind: 'custom' };
       groupMap[key].tabs.push(tab);
-      usedTabIds.add(tab.id);
       continue;
     }
 
@@ -219,28 +382,10 @@ function buildPopupTabGroups() {
 
     if (!groupMap[hostname]) groupMap[hostname] = { domain: hostname, label: hostname, tabs: [], kind: 'domain' };
     groupMap[hostname].tabs.push(tab);
-    usedTabIds.add(tab.id);
   }
 
   if (landingTabs.length > 0) {
     groupMap['__landing-pages__'] = { domain: '__landing-pages__', label: '__landing-pages__', tabs: landingTabs, kind: 'landing' };
-  }
-
-  // Chrome tab groups (tabs not yet in any session/domain/custom group)
-  const chromeGroupMap = {};
-  for (const cg of tabGroups) {
-    const cgTabs = cg.tabs.filter(tab => !usedTabIds.has(tab.id));
-    if (!cgTabs.length) continue;
-    chromeGroupMap[cg.id] = {
-      domain: `__chrome_group__:${cg.id}`,
-      label: cg.title || `Group ${cg.id}`,
-      tabs: cgTabs,
-      kind: 'chrome-group',
-      color: cg.color,
-      collapsed: cg.collapsed,
-      chromeGroupId: cg.id,
-    };
-    cgTabs.forEach(tab => usedTabIds.add(tab.id));
   }
 
   const landingHostnames = new Set(getLandingPatterns().map(p => p.hostname).filter(Boolean));
@@ -252,7 +397,6 @@ function buildPopupTabGroups() {
 
   const sessionGroupsList = Object.values(sessionGroupMap).filter(g => g.tabs.length > 0);
   const automaticGroups = Object.values(groupMap);
-  const chromeGroupsList = Object.values(chromeGroupMap);
 
   const sortedAutomatic = automaticGroups.sort((a, b) => {
     const aIsLanding = a.domain === '__landing-pages__';
@@ -268,24 +412,14 @@ function buildPopupTabGroups() {
   const orderedManual = applyOrderFn ? applyOrderFn(sessionGroupsList, groupOrder) : sessionGroupsList;
   const orderedAuto = applyOrderFn ? applyOrderFn(sortedAutomatic, groupOrder) : sortedAutomatic;
 
-  let groups = [...orderedManual, ...orderedAuto, ...chromeGroupsList];
-
-  // Ungrouped
-  const ungroupedTabs = openTabs.filter(tab => !usedTabIds.has(tab.id));
-  if (ungroupedTabs.length > 0) {
-    groups.push({ domain: '__ungrouped__', label: popupI18n.t ? popupI18n.t('ungroupedLabel') : 'Ungrouped', tabs: ungroupedTabs, kind: 'ungrouped' });
-  }
-
-  return groups;
+  return [...orderedManual, ...orderedAuto];
 }
 
 function renderPopupShortcuts() {
   const listEl = document.getElementById('popupShortcutsList');
-  const countEl = document.getElementById('popupShortcutsCount');
   const emptyEl = document.getElementById('popupShortcutsEmpty');
-  if (!listEl || !countEl || !emptyEl) return;
+  if (!listEl || !emptyEl) return;
 
-  countEl.textContent = String(popupState.quickShortcuts.length);
   listEl.classList.add('is-entering');
   listEl.innerHTML = popupState.quickShortcuts.length
     ? popupState.quickShortcuts.map((s, i) => renderShortcutCard(s, i)).join('')
@@ -340,16 +474,19 @@ function getGroupDisplayLabel(group) {
 function renderGroupNav(group, index) {
   const label = getGroupDisplayLabel(group);
   const iconData = popupIcons.getGroupIcon ? popupIcons.getGroupIcon(group, label, 32) : { src: '', fallbackLabel: label.slice(0, 2).toUpperCase() };
+  const fallbackLabel = escapeAttr(iconData.fallbackLabel || label.slice(0, 2).toUpperCase());
+  const fallbackSrc = escapeAttr(iconData.fallbackSrc || '');
   return `
     <button class="group-nav-button" type="button" data-action="jump-popup-group" data-group-id="${escapeAttr(group.domain)}" aria-label="${escapeAttr(label)}" style="--s:${index}">
-      ${iconData.src ? `<img class="group-nav-icon" src="${escapeAttr(iconData.src)}" alt="">` : ''}
+      ${iconData.src ? `<img class="group-nav-icon" src="${escapeAttr(iconData.src)}" alt="" draggable="false" data-fallback-src="${fallbackSrc}">` : ''}
+      <span class="group-nav-fallback"${iconData.src ? ' style="display:none"' : ''}>${fallbackLabel}</span>
     </button>
   `;
 }
 
 function renderTabGroup(group, groupIndex) {
   const label = getGroupDisplayLabel(group);
-  const rows = (group.tabs || []).map((tab, tabIndex) => {
+  const rows = getOrderedUniqueTabsForGroup(group).map((tab, tabIndex) => {
     const title = getTabLabel(tab);
     const safeUrl = escapeAttr(tab.url || '');
     const safeTitle = escapeAttr(title);
@@ -360,7 +497,9 @@ function renderTabGroup(group, groupIndex) {
       <div class="popup-tab-row" style="--g:${groupIndex};--r:${tabIndex}" data-action="open-popup-url" data-url="${safeUrl}" data-tab-id="${tab.id}">
         ${iconData.sources?.[0] ? `<img class="popup-tab-favicon" src="${escapeAttr(iconData.sources[0])}" alt="">` : `<span class="popup-tab-favicon-fallback">${escapeAttr(fallbackLabel)}</span>`}
         <span class="popup-tab-title" title="${safeTitle}">${safeTitle}</span>
-        <button class="popup-tab-open-btn" type="button" data-action="close-popup-tab" data-tab-id="${tab.id}">${closeLabel}</button>
+        <button class="popup-tab-close-btn" type="button" data-action="close-popup-tab" data-tab-id="${tab.id}" aria-label="${escapeAttr(closeLabel)}" title="${escapeAttr(closeLabel)}">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
       </div>
     `;
   }).join('');
@@ -376,12 +515,10 @@ function renderTabGroup(group, groupIndex) {
 function renderPopupTabs() {
   const listEl = document.getElementById('popupTabsList');
   const navEl = document.getElementById('popupGroupNav');
-  const countEl = document.getElementById('popupTabsCount');
   const emptyEl = document.getElementById('popupTabsEmpty');
-  if (!listEl || !navEl || !countEl || !emptyEl) return;
+  if (!listEl || !navEl || !emptyEl) return;
 
   const tabs = popupState.openTabs;
-  countEl.textContent = String(tabs.length);
 
   if (tabs.length === 0) {
     navEl.innerHTML = '';
@@ -464,6 +601,66 @@ async function findTabByUrl(url) {
   }
 }
 
+async function openPopupTab(tabId, fallbackUrl = '') {
+  if (!tabId) {
+    await openPopupUrl(fallbackUrl);
+    return;
+  }
+
+  let targetTab = null;
+  try {
+    targetTab = await chrome.tabs.get(tabId);
+  } catch {
+    targetTab = null;
+  }
+
+  if (!targetTab?.id) {
+    await openPopupUrl(fallbackUrl);
+    return;
+  }
+
+  let currentWindow = null;
+  try {
+    currentWindow = await chrome.windows.getCurrent();
+  } catch {
+    currentWindow = null;
+  }
+
+  if (currentWindow?.id && targetTab.windowId && targetTab.windowId !== currentWindow.id) {
+    const targetUrl = targetTab.url || fallbackUrl;
+    if (!targetUrl) return;
+    await chrome.tabs.create({
+      windowId: currentWindow.id,
+      url: targetUrl,
+      active: true,
+    });
+    window.close();
+    return;
+  }
+
+  await chrome.tabs.update(targetTab.id, { active: true });
+  window.close();
+}
+
+function handlePopupGroupNavImageError(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLImageElement)) return;
+  if (!target.classList.contains('group-nav-icon')) return;
+
+  const fallbackSrc = String(target.dataset.fallbackSrc || '').trim();
+  if (fallbackSrc && target.dataset.fallbackApplied !== 'true') {
+    target.dataset.fallbackApplied = 'true';
+    target.src = fallbackSrc;
+    return;
+  }
+
+  target.style.display = 'none';
+  const sibling = target.nextElementSibling;
+  if (sibling?.classList.contains('group-nav-fallback')) {
+    sibling.style.display = '';
+  }
+}
+
 async function refreshPopup() {
   if (popupTheme.loadThemePreferences) {
     await popupTheme.loadThemePreferences();
@@ -480,7 +677,69 @@ async function refreshPopup() {
   }
 }
 
+function schedulePopupRefresh(delay = 120) {
+  if (popupRefreshTimer) {
+    clearTimeout(popupRefreshTimer);
+  }
+  popupRefreshTimer = setTimeout(() => {
+    popupRefreshTimer = null;
+    void refreshPopupSafely();
+  }, delay);
+}
+
+async function refreshPopupSafely() {
+  if (popupRefreshInFlight) {
+    popupRefreshQueued = true;
+    return popupRefreshInFlight;
+  }
+
+  popupRefreshInFlight = (async () => {
+    try {
+      await refreshPopup();
+    } finally {
+      popupRefreshInFlight = null;
+      if (popupRefreshQueued) {
+        popupRefreshQueued = false;
+        schedulePopupRefresh(0);
+      }
+    }
+  })();
+
+  return popupRefreshInFlight;
+}
+
+function handlePopupStorageChanged(changes, areaName) {
+  if (areaName !== 'local') return;
+  const hasRelevantChange = Object.keys(changes || {}).some(key => POPUP_REFRESH_KEYS.has(key));
+  if (!hasRelevantChange) return;
+  schedulePopupRefresh();
+}
+
+function registerPopupAutoRefresh() {
+  const schedule = () => schedulePopupRefresh();
+
+  chrome.tabs?.onActivated?.addListener(schedule);
+  chrome.tabs?.onAttached?.addListener(schedule);
+  chrome.tabs?.onCreated?.addListener(schedule);
+  chrome.tabs?.onDetached?.addListener(schedule);
+  chrome.tabs?.onMoved?.addListener(schedule);
+  chrome.tabs?.onRemoved?.addListener(schedule);
+  chrome.tabs?.onUpdated?.addListener(schedule);
+  chrome.tabGroups?.onCreated?.addListener(schedule);
+  chrome.tabGroups?.onRemoved?.addListener(schedule);
+  chrome.tabGroups?.onUpdated?.addListener(schedule);
+  chrome.storage?.onChanged?.addListener(handlePopupStorageChanged);
+  chrome.runtime?.onMessage?.addListener(message => {
+    if (message?.action === 'tabs-changed') {
+      schedule();
+    }
+  });
+}
+
 function initializePopup() {
+  document.addEventListener('error', handlePopupGroupNavImageError, true);
+  registerPopupAutoRefresh();
+
   document.addEventListener('click', async e => {
     const actionEl = e.target.closest('[data-action]');
     if (!actionEl) return;
@@ -515,8 +774,7 @@ function initializePopup() {
       e.preventDefault();
       const tabId = Number(actionEl.dataset.tabId);
       if (tabId) {
-        await chrome.tabs.update(tabId, { active: true });
-        window.close();
+        await openPopupTab(tabId, actionEl.dataset.url || '');
       } else {
         await openPopupUrl(actionEl.dataset.url || '');
       }
@@ -530,7 +788,7 @@ function initializePopup() {
     }
   });
 
-  refreshPopup()
+  refreshPopupSafely()
     .then(() => requestAnimationFrame(() => document.body.classList.add('is-ready')))
     .catch(() => {
       renderPopupShortcuts();

@@ -437,18 +437,14 @@ function applyThemePreferences() {
   const root = document.documentElement;
   const body = document.body;
   const theme = getResolvedThemeDefinition(themePreferences);
-  const surfaceOpacity = themePreferences.surfaceOpacity;
-  const borderOpacity = Math.max(8, surfaceOpacity);
-  const badgeOpacity = Math.max(3, Math.round(surfaceOpacity * 0.28));
-  const fallbackOpacity = Math.max(4, Math.round(surfaceOpacity * 0.36));
+  const opacityVars = computeThemeOpacityVars(themePreferences.surfaceOpacity);
 
   Object.entries(theme.vars).forEach(([name, value]) => {
     root.style.setProperty(name, value);
   });
-  root.style.setProperty('--custom-surface-opacity', `${surfaceOpacity}%`);
-  root.style.setProperty('--custom-border-opacity', `${borderOpacity}%`);
-  root.style.setProperty('--custom-badge-opacity', `${badgeOpacity}%`);
-  root.style.setProperty('--custom-fallback-opacity', `${fallbackOpacity}%`);
+  Object.entries(opacityVars).forEach(([name, value]) => {
+    root.style.setProperty(name, value);
+  });
   if (body) {
     body.classList.toggle('theme-tone-light', theme.tone === 'light');
     body.classList.toggle('theme-tone-dark', theme.tone === 'dark');
@@ -468,7 +464,6 @@ function applyThemePreferences() {
       body.classList.remove('has-custom-background');
     }
   }
-
 }
 
 function renderThemeMenu() {
@@ -2011,6 +2006,7 @@ async function loadThemePreferences() {
 
 function syncPopupTheme(targetDoc) {
   const root = targetDoc?.documentElement;
+  const body = targetDoc?.body;
   if (!root) return;
   const theme = getResolvedThemeDefinition(themePreferences);
   const opacityVars = computeThemeOpacityVars(themePreferences.surfaceOpacity);
@@ -2021,6 +2017,10 @@ function syncPopupTheme(targetDoc) {
   Object.entries(opacityVars).forEach(([name, value]) => {
     root.style.setProperty(name, value);
   });
+  if (body) {
+    body.classList.toggle('theme-tone-light', theme.tone === 'light');
+    body.classList.toggle('theme-tone-dark', theme.tone === 'dark');
+  }
 }
 
 async function saveThemePreferences(nextPreferences) {
@@ -2039,13 +2039,14 @@ globalThis.TabOutThemeControls = {
   filterRealTabs,
   getResolvedThemeDefinition,
   getResolvedTone,
+  getQuickShortcuts,
+  loadThemePreferences,
   normalizeShortcutUrl,
   normalizeQuickShortcuts,
-  getQuickShortcuts,
-  saveQuickShortcuts,
+  normalizeThemePreferences,
   removeQuickShortcutById,
   saveQuickShortcutOrder,
-  loadThemePreferences,
+  saveQuickShortcuts,
   syncPopupTheme,
   normalizeThemePreferences,
 };

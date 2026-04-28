@@ -6,10 +6,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const appEntryJs = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+const backgroundJs = fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8');
 const runtimeJs = fs.readFileSync(path.join(__dirname, 'dashboard-runtime.js'), 'utf8');
 const themeJs = fs.readFileSync(path.join(__dirname, 'theme-controls.js'), 'utf8');
 const drawerJs = fs.readFileSync(path.join(__dirname, 'drawer-manager.js'), 'utf8');
 const helperJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
+const popupJs = fs.readFileSync(path.join(__dirname, 'popup', 'popup.js'), 'utf8');
+const popupHtml = fs.readFileSync(path.join(__dirname, 'popup', 'popup.html'), 'utf8');
 const configJs = fs.readFileSync(path.join(__dirname, 'config.js'), 'utf8');
 const configLoaderJs = fs.readFileSync(path.join(__dirname, 'config-loader.js'), 'utf8');
 const appJs = [appEntryJs, runtimeJs, themeJs, drawerJs, helperJs].join('\n');
@@ -78,6 +81,55 @@ test('icon fallback handling avoids inline event handlers', () => {
   assert.match(helperJs, /setImageFallbackAttributes/);
 });
 
+test('popup group nav keeps visible fallback labels and popup-local image fallback handling', () => {
+  assert.match(popupJs, /class="group-nav-fallback"/);
+  assert.match(popupJs, /data-fallback-src=/);
+  assert.match(popupJs, /document\.addEventListener\('error', handlePopupGroupNavImageError, true\)/);
+});
+
+test('popup auto-refreshes when tabs and local storage change', () => {
+  assert.match(popupJs, /chrome\.tabs\?\.onCreated\?\.addListener\(schedule\)/);
+  assert.match(popupJs, /chrome\.tabs\?\.onMoved\?\.addListener\(schedule\)/);
+  assert.match(popupJs, /chrome\.tabGroups\?\.onUpdated\?\.addListener\(schedule\)/);
+  assert.match(popupJs, /chrome\.storage\?\.onChanged\?\.addListener\(handlePopupStorageChanged\)/);
+  assert.match(popupJs, /const POPUP_REFRESH_KEYS = new Set/);
+});
+
+test('popup opens tabs from other windows in the current window instead of focusing the old window', () => {
+  assert.match(popupJs, /targetTab\.windowId !== currentWindow\.id/);
+  assert.match(popupJs, /await chrome\.tabs\.create\(\{\s*windowId: currentWindow\.id,/);
+  assert.match(popupJs, /await openPopupTab\(tabId, actionEl\.dataset\.url \|\| ''\)/);
+});
+
+test('popup removes redundant shortcuts and open-tabs summary rows', () => {
+  assert.doesNotMatch(popupHtml, /id="popupShortcutsCount"/);
+  assert.doesNotMatch(popupHtml, /id="popupTabsCount"/);
+});
+
+test('popup follows dashboard tab-order storage and richer title shaping', () => {
+  assert.match(popupJs, /const GROUP_TAB_ORDER_KEY = 'groupTabOrder'/);
+  assert.match(popupJs, /popupState\.groupTabOrder/);
+  assert.match(popupJs, /function getOrderedUniqueTabsForGroup\(group\)/);
+  assert.match(popupJs, /function smartTitle\(title, url\)/);
+  assert.match(popupJs, /function cleanTitle\(title, hostname\)/);
+});
+
+test('manifest action keeps the popup entry wired to popup html', () => {
+  const manifest = fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8');
+
+  assert.match(manifest, /"default_popup": "popup\/popup\.html"/);
+  assert.match(popupHtml, /<script src="popup\.js"><\/script>/);
+});
+
+test('theme controls expose popup helpers without dropping main theme runtime exports', () => {
+  assert.match(themeJs, /getResolvedThemeDefinition/);
+  assert.match(themeJs, /getResolvedTone/);
+  assert.match(themeJs, /loadThemePreferences/);
+  assert.match(themeJs, /getQuickShortcuts/);
+  assert.match(themeJs, /saveQuickShortcutOrder/);
+  assert.match(themeJs, /syncPopupTheme/);
+});
+
 test('index includes a back-to-top floating button', () => {
   assert.match(html, /id="backToTopBtn"/);
 });
@@ -109,6 +161,11 @@ test('optional local config is loaded safely before app mount', () => {
   assert.match(configLoaderJs, /script\.onerror = \(\) => resolve\(\)/);
   assert.match(appEntryJs, /TabHarborConfigReady/);
   assert.match(appEntryJs, /await appConfigReady/);
+});
+
+test('background keeps the toolbar badge empty', () => {
+  assert.match(backgroundJs, /await chrome\.action\.setBadgeText\(\{\s*text:\s*''\s*\}\)/);
+  assert.doesNotMatch(backgroundJs, /String\(count\)/);
 });
 
 test('manifest keeps only permissions required by the shipped runtime', () => {
