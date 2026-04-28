@@ -31,12 +31,23 @@
     }
   }
 
+  function shouldNotifyChromeGroupUpdate(changeInfo) {
+    if (!changeInfo || typeof changeInfo !== 'object') return false;
+    const changedKeys = Object.keys(changeInfo);
+    if (changedKeys.length === 0) return false;
+    return changedKeys.some(key => key !== 'collapsed');
+  }
+
   function attachChromeListeners() {
     if (chromeListenersAttached || typeof chrome === 'undefined') return;
 
     const eventBindings = [
       [chrome.tabGroups?.onCreated, group => notifyChromeGroupSubscribers({ source: 'tabGroups.onCreated', group })],
-      [chrome.tabGroups?.onUpdated, (groupId, changeInfo) => notifyChromeGroupSubscribers({ source: 'tabGroups.onUpdated', groupId, changeInfo })],
+      [chrome.tabGroups?.onUpdated, (groupId, changeInfo) => {
+        // Collapsing or expanding a group should not trigger a full import cycle.
+        if (!shouldNotifyChromeGroupUpdate(changeInfo)) return;
+        notifyChromeGroupSubscribers({ source: 'tabGroups.onUpdated', groupId, changeInfo });
+      }],
       [chrome.tabGroups?.onRemoved, group => notifyChromeGroupSubscribers({ source: 'tabGroups.onRemoved', group })],
       [chrome.tabs?.onAttached, (tabId, attachInfo) => notifyChromeGroupSubscribers({ source: 'tabs.onAttached', tabId, attachInfo })],
       [chrome.tabs?.onCreated, tab => notifyChromeGroupSubscribers({ source: 'tabs.onCreated', tab })],

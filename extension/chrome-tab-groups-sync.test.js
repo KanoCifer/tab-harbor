@@ -368,6 +368,22 @@ test('subscribeToChromeTabGroupChanges notifies on external Chrome group changes
   unsubscribe();
 });
 
+test('subscribeToChromeTabGroupChanges ignores collapse-only group updates', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+
+  const events = [];
+  const unsubscribe = subscribeToChromeTabGroupChanges(event => {
+    events.push(event);
+  });
+
+  globalThis.chrome.tabGroups.onUpdated.emit(501, { collapsed: true });
+
+  assert.equal(events.length, 0);
+
+  unsubscribe();
+});
+
 test('syncChromeTabGroupExpansionForTab expands target group and collapses sibling groups in same window', async () => {
   resetChromeGroupState();
   await saveChromeTabGroupsSetting(true);
