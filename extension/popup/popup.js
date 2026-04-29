@@ -412,18 +412,27 @@ function renderPopupTabs() {
   const tabs = popupState.openTabs;
 
   if (tabs.length === 0) {
-    navEl.innerHTML = '';
-    listEl.innerHTML = '';
-    emptyEl.hidden = false;
+    if (navEl.innerHTML !== '') navEl.innerHTML = '';
+    if (listEl.innerHTML !== '') listEl.innerHTML = '';
+    if (emptyEl.hidden !== false) emptyEl.hidden = false;
     return;
   }
 
   const groups = buildPopupTabGroups();
-  navEl.innerHTML = groups.map((g, i) => renderGroupNav(g, i)).join('');
-  navEl.classList.add('is-entering');
-  listEl.innerHTML = groups.map((g, i) => renderTabGroup(g, i)).join('');
-  listEl.classList.add('is-entering');
-  emptyEl.hidden = true;
+  const newNavHtml = groups.map((g, i) => renderGroupNav(g, i)).join('');
+  const newListHtml = groups.map((g, i) => renderTabGroup(g, i)).join('');
+
+  if (navEl.innerHTML !== newNavHtml) {
+    navEl.innerHTML = newNavHtml;
+    navEl.classList.add('is-entering');
+  }
+  if (listEl.innerHTML !== newListHtml) {
+    listEl.innerHTML = newListHtml;
+    listEl.classList.add('is-entering');
+  }
+  if (emptyEl.hidden !== true) {
+    emptyEl.hidden = true;
+  }
 
   requestAnimationFrame(() => requestAnimationFrame(() => {
     navEl.classList.add('is-ready');
