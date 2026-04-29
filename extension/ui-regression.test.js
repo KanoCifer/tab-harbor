@@ -447,6 +447,8 @@ test('quick shortcuts support drag reordering with persisted order and drag prev
 
   assert.match(themeJs, /const\s*\{[\s\S]*reorderSubsetByIds:\s*themeReorderSubsetByIds,[\s\S]*\}\s*=\s*globalThis\.TabOutListOrder \|\| \{\};/);
   assert.match(themeJs, /class="quick-shortcut-card" data-shortcut-id="\$\{safeId\}"/);
+  assert.match(themeJs, /const safeAriaLabel = themeEscapeHtmlAttribute \? themeEscapeHtmlAttribute\(label\) : label\.replace\(\/"\/g, '&quot;'\);/);
+  assert.match(themeJs, /aria-label="\$\{safeAriaLabel\}"/);
   assert.match(themeJs, /let quickShortcutDragState = null;/);
   assert.match(themeJs, /document\.body\.classList\.add\('quick-shortcut-list-dragging'\)/);
   assert.match(themeJs, /quickShortcutSuppressClickUntil = Date\.now\(\) \+ 250/);
@@ -592,6 +594,11 @@ test('interactive controls keep button semantics and reduced-motion support', ()
   assert.match(appJs, /behavior:\s*prefersReducedMotion\(\) \? 'auto' : 'smooth'/);
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
   assert.match(css, /grid-template-columns:\s*repeat\(auto-fit, minmax\(128px, 1fr\)\);/);
+});
+
+test('drawer detail escapes todo title and description before injecting HTML', () => {
+  assert.match(drawerJs, /<h3>\$\{drawerEscapeHtml \? drawerEscapeHtml\(todo\.title\) : todo\.title\}<\/h3>/);
+  assert.match(drawerJs, /drawerEscapeHtml \? drawerEscapeHtml\(todo\.description \|\| 'Add a note when this task needs more context\.'\) : \(todo\.description \|\| 'Add a note when this task needs more context\.'\)/);
 });
 
 test('theme state uses separate mode and palette preferences', () => {

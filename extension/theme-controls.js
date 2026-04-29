@@ -5,6 +5,7 @@ const {
 } = globalThis.TabHarborI18n || {};
 
 const {
+  escapeHtml: themeEscapeHtml,
   escapeHtmlAttribute: themeEscapeHtmlAttribute,
   getFallbackLabel: themeGetFallbackLabel,
   getIconSources: themeGetIconSources,
@@ -516,7 +517,7 @@ function renderThemeMenu() {
       <span class="theme-option-main">
         <span class="theme-option-swatch" aria-hidden="true"></span>
         <span>
-          <span class="theme-option-name">${family.name}</span>
+          <span class="theme-option-name">${themeEscapeHtml ? themeEscapeHtml(family.name) : family.name}</span>
         </span>
       </span>
       <span class="theme-option-check" aria-hidden="true">
@@ -1212,6 +1213,8 @@ function previewQuickShortcutOrder(clientX, clientY) {
 
 function renderQuickShortcutCard(shortcut) {
   const label = getShortcutLabel(shortcut);
+  const safeLabel = themeEscapeHtml ? themeEscapeHtml(label) : label;
+  const safeAriaLabel = themeEscapeHtmlAttribute ? themeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
   const iconData = themeGetIconSources({ url: shortcut.url, title: label }, 32);
   const faviconUrl = iconData.sources[0] || '';
   const fallbackUrl = iconData.sources[1] || '';
@@ -1232,13 +1235,13 @@ function renderQuickShortcutCard(shortcut) {
 
   return `
     <div class="quick-shortcut-card" data-shortcut-id="${safeId}">
-      <button class="quick-shortcut-open" type="button" data-action="open-quick-shortcut" data-shortcut-url="${safeUrl}" aria-label="${label}" draggable="false">
+      <button class="quick-shortcut-open" type="button" data-action="open-quick-shortcut" data-shortcut-url="${safeUrl}" aria-label="${safeAriaLabel}" draggable="false">
         <span class="quick-shortcut-icon-wrap">
           ${primaryIconUrl ? `<img class="quick-shortcut-icon${customIcon.kind === 'image' ? ' quick-shortcut-icon-custom' : ''}" src="${primaryIconUrl}" alt="" draggable="false" data-fallback-src="${safeIconErrorFallback}">` : ''}
           ${glyphIcon ? `<span class="quick-shortcut-custom-glyph" aria-hidden="true">${glyphIcon}</span>` : ''}
           <span class="quick-shortcut-fallback"${primaryIconUrl || glyphIcon ? ' style="display:none"' : ''}>${fallbackLabel}</span>
         </span>
-        <span class="quick-shortcut-label">${label}</span>
+        <span class="quick-shortcut-label">${safeLabel}</span>
       </button>
       <button class="quick-shortcut-edit" type="button" data-action="edit-quick-shortcut" data-shortcut-id="${safeId}" aria-label="${themeT ? themeT('editQuickTab') : 'Edit quick tab'}">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a2.25 2.25 0 1 1 3.182 3.182L10.582 17.13a4.5 4.5 0 0 1-1.897 1.13L6 19l.74-2.685a4.5 4.5 0 0 1 1.13-1.897L16.862 4.487ZM19.5 7.125 16.875 4.5" /></svg>

@@ -15,6 +15,13 @@
     return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=${size}`;
   }
 
+  function escapeHtml(value = '') {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
   function escapeHtmlAttribute(value = '') {
     return String(value)
       .replace(/&/g, '&amp;')
@@ -66,6 +73,7 @@
   }
 
   const api = {
+    escapeHtml,
     escapeHtmlAttribute,
     getFallbackLabel,
     getGoogleFaviconUrl,
