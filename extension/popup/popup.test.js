@@ -40,10 +40,79 @@ globalThis.TabOutIconUtils = {
   getFallbackLabel: (label, host) => (label || host || '').slice(0, 1).toUpperCase() || '?',
   getGroupIcon: () => ({ src: '', fallbackLabel: '?' }),
 };
-globalThis.TabOutListOrder = {};
+globalThis.TabOutListOrder = {
+  reorderSubsetByIds: (items, orderIds, includeItem) => {
+    if (!Array.isArray(items)) return [];
+    const list = items.slice();
+    const shouldInclude = typeof includeItem === 'function' ? includeItem : () => true;
+    const subset = list.filter(shouldInclude);
+    const normalizedOrder = Array.isArray(orderIds) ? orderIds.map(id => String(id)).filter(Boolean) : [];
+    if (!subset.length || subset.length !== normalizedOrder.length) return list;
+    const subsetMap = new Map(subset.map(item => [String(item.id), item]));
+    if (subsetMap.size !== subset.length) return list;
+    if (normalizedOrder.some(id => !subsetMap.has(id))) return list;
+    let nextIndex = 0;
+    return list.map(item => {
+      if (!shouldInclude(item)) return item;
+      const reorderedItem = subsetMap.get(normalizedOrder[nextIndex]);
+      nextIndex += 1;
+      return reorderedItem || item;
+    });
+  },
+};
 globalThis.TabOutSessionGroups = { normalizeSessionGroups: v => v || { groups: [], assignments: {} } };
 globalThis.TabOutGroupOrder = { normalizeGroupOrderState: v => v || { sessionOrder: [], pinnedOrder: [], pinEnabled: false } };
 globalThis.TabHarborI18n = { t: key => key };
+
+// Mock ui-helpers.js globals (now loaded by popup.html before popup.js)
+// These mocks preserve the original behavior that popup.js depended on.
+globalThis.friendlyDomain = hostname => String(hostname || '').replace(/^www\./, '').replace(/\./g, ' ').trim();
+globalThis.stripTitleNoise = title => {
+  if (!title) return '';
+  title = String(title);
+  title = title.replace(/^\(\d+\+?\)\s*/, '');
+  title = title.replace(/\s*\([\d,]+\+?\)\s*/g, ' ');
+  title = title.replace(/\s*[\-‐-―]\s*[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
+  title = title.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
+  title = title.replace(/\s+on X:\s*/, ': ');
+  title = title.replace(/\s*\/\s*X\s*$/, '');
+  return title.trim();
+};
+globalThis.cleanTitle = (title, hostname) => {
+  if (!title || !hostname) return title || '';
+  const friendly = globalThis.friendlyDomain(hostname);
+  const domain = hostname.replace(/^www\./, '');
+  const seps = [' - ', ' | ', ' — ', ' · ', ' – '];
+  for (const sep of seps) {
+    const idx = title.lastIndexOf(sep);
+    if (idx === -1) continue;
+    const suffix = title.slice(idx + sep.length).trim();
+    const suffixLow = suffix.toLowerCase();
+    if (
+      suffixLow === domain.toLowerCase() ||
+      suffixLow === friendly.toLowerCase() ||
+      suffixLow === domain.replace(/\.\w+$/, '').toLowerCase() ||
+      domain.toLowerCase().includes(suffixLow) ||
+      friendly.toLowerCase().includes(suffixLow)
+    ) {
+      const cleaned = title.slice(0, idx).trim();
+      if (cleaned.length >= 5) return cleaned;
+    }
+  }
+  return title;
+};
+globalThis.smartTitle = (title, url) => {
+  if (!url) return title || '';
+  let pathname = '', hostname = '';
+  try {
+    const u = new URL(url);
+    pathname = u.pathname;
+    hostname = u.hostname;
+  } catch { return title || ''; }
+  const titleIsUrl = !title || title === url || title.startsWith(hostname) || title.startsWith('http');
+  if ((hostname === 'www.youtube.com' || hostname === 'youtube.com') && pathname === '/watch' && titleIsUrl) return 'YouTube Video';
+  return title || url;
+};
 
 // Prevent LOCAL_* globals from interfering
 globalThis.LOCAL_LANDING_PAGE_PATTERNS = undefined;
