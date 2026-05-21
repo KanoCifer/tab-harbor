@@ -126,6 +126,8 @@ let suppressChromeTabGroupsImportUntil = 0;
 const ENTRY_ANIMATIONS_CLASS = 'entry-animations-enabled';
 let entryAnimationsTimer = null;
 const CHROME_TAB_GROUPS_DEBUG_KEY = 'chromeTabGroupsDebug';
+const HITOKOTO_CACHE_KEY = 'hitokotoCache';
+const HITOKOTO_CACHE_LIMIT = 5;
 
 function reorderVisibleItemsByIds(items, orderIds, includeItem) {
   if (reorderSubsetByIds) {
@@ -597,6 +599,69 @@ async function fetchHitokoto(timeoutMs = 3000) {
   } catch (err) {
     return null;
   }
+}
+
+function normalizeHitokotoEntry(data) {
+  if (!data || typeof data !== 'object') return null;
+  const hitokoto = String(data.hitokoto || '').trim();
+  if (!hitokoto) return null;
+  return {
+    hitokoto,
+    from_who: String(data.from_who || '').trim(),
+    from: String(data.from || '').trim(),
+  };
+}
+
+function getHitokotoCache() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HITOKOTO_CACHE_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(normalizeHitokotoEntry).filter(Boolean).slice(0, HITOKOTO_CACHE_LIMIT);
+  } catch (_err) {
+    return [];
+  }
+}
+
+function saveHitokotoCache(nextEntries) {
+  try {
+    const entries = Array.isArray(nextEntries) ? nextEntries : [];
+    localStorage.setItem(HITOKOTO_CACHE_KEY, JSON.stringify(entries.slice(0, HITOKOTO_CACHE_LIMIT)));
+  } catch (_err) {
+    // Cache writes are best-effort; the dashboard should stay usable without them.
+  }
+}
+
+function addHitokotoToCache(data) {
+  const entry = normalizeHitokotoEntry(data);
+  if (!entry) return null;
+  const existing = getHitokotoCache().filter(item => item.hitokoto !== entry.hitokoto);
+  saveHitokotoCache([entry, ...existing]);
+  return entry;
+}
+
+function setHitokotoContent(textEl, fromEl, data) {
+  const entry = normalizeHitokotoEntry(data);
+  if (!entry || !textEl || !fromEl) return false;
+  textEl.textContent = entry.hitokoto;
+  const from = [entry.from_who, entry.from].filter(Boolean).join(' · ');
+  fromEl.textContent = from ? ` — ${from}` : '';
+  return true;
+}
+
+function renderCachedHitokoto(textEl, fromEl) {
+  return setHitokotoContent(textEl, fromEl, getHitokotoCache()[0]);
+}
+
+function refreshHitokotoInBackground(textEl, fromEl) {
+  fetchHitokoto().then(data => {
+    if (typeof themePreferences !== 'undefined' && themePreferences.hitokotoEnabled === false) return;
+    const entry = addHitokotoToCache(data);
+    if (!entry) return;
+    if (setHitokotoContent(textEl, fromEl, entry)) {
+      const hitokotoEl = document.getElementById('hitokoto');
+      if (hitokotoEl) hitokotoEl.style.display = '';
+    }
+  }).catch(() => { /* silently fail */ });
 }
 
 async function fetchOpenTabs() {
@@ -2539,17 +2604,9 @@ async function renderStaticDashboard() {
   const hitokotoTextEl = document.getElementById('hitokotoText');
   const hitokotoFromEl = document.getElementById('hitokotoFrom');
   if (hitokotoEnabled && hitokotoEl && hitokotoTextEl && hitokotoFromEl) {
-    try {
-      const data = await fetchHitokoto();
-      if (data) {
-        hitokotoTextEl.textContent = data.hitokoto;
-        const from = [data.from_who, data.from].filter(Boolean).join(' · ');
-        hitokotoFromEl.textContent = from ? ` — ${from}` : '';
-        hitokotoEl.style.display = '';
-      }
-    } catch (_e) {
-      // Silently fail — hitokoto is a nice-to-have, not critical
-    }
+    const hasCachedHitokoto = renderCachedHitokoto(hitokotoTextEl, hitokotoFromEl);
+    hitokotoEl.style.display = hasCachedHitokoto ? '' : 'none';
+    void refreshHitokotoInBackground(hitokotoTextEl, hitokotoFromEl);
   } else if (hitokotoEl) {
     hitokotoEl.style.display = 'none';
   }
@@ -2721,13 +2778,9 @@ document.addEventListener('click', async (e) => {
     const hitokotoFromEl = document.getElementById('hitokotoFrom');
     if (hitokotoEl) hitokotoEl.style.display = nextEnabled ? '' : 'none';
     if (nextEnabled && hitokotoTextEl && hitokotoFromEl) {
-      // Re-fetch hitokoto when turning back on (with timeout)
-      fetchHitokoto().then(data => {
-        if (!data) return;
-        hitokotoTextEl.textContent = data.hitokoto;
-        const from = [data.from_who, data.from].filter(Boolean).join(' · ');
-        hitokotoFromEl.textContent = from ? ` — ${from}` : '';
-      }).catch(() => { /* silently fail */ });
+      const hasCachedHitokoto = renderCachedHitokoto(hitokotoTextEl, hitokotoFromEl);
+      if (hitokotoEl) hitokotoEl.style.display = hasCachedHitokoto ? '' : 'none';
+      void refreshHitokotoInBackground(hitokotoTextEl, hitokotoFromEl);
     } else if (!nextEnabled && hitokotoTextEl && hitokotoFromEl) {
       hitokotoTextEl.textContent = '';
       hitokotoFromEl.textContent = '';

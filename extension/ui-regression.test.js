@@ -826,3 +826,15 @@ test('theme menu keeps chrome tab groups above hitokoto and uses left-aligned to
   assert.match(css, /\.theme-menu-toggle-text\s*\{[\s\S]*padding-top:\s*0;[\s\S]*flex:\s*1 1 auto;/);
   assert.match(css, /\.theme-menu-toggle-button-row\s*\{[\s\S]*cursor:\s*default;/);
 });
+
+test('hitokoto uses cached text and refreshes in the background without blocking dashboard render', () => {
+  assert.match(runtimeJs, /const HITOKOTO_CACHE_KEY = 'hitokotoCache';/);
+  assert.match(runtimeJs, /function renderCachedHitokoto\(/);
+  assert.match(runtimeJs, /function refreshHitokotoInBackground\(/);
+  assert.match(runtimeJs, /renderCachedHitokoto\(hitokotoTextEl, hitokotoFromEl\);[\s\S]*void refreshHitokotoInBackground\(hitokotoTextEl, hitokotoFromEl\);/);
+
+  const renderStaticDashboardBody = runtimeJs.match(
+    /async function renderStaticDashboard\(\) \{([\s\S]*?)\n\}\n\nasync function renderDashboard/
+  )?.[1] || '';
+  assert.doesNotMatch(renderStaticDashboardBody, /await fetchHitokoto/);
+});
