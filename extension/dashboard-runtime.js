@@ -3234,7 +3234,7 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
   }
 
   if (landingTabs.length > 0) {
-    groupMap.__landing_pages__ = undefined;
+    delete groupMap.__landing_pages__;
     groupMap['__landing-pages__'] = { domain: '__landing-pages__', tabs: landingTabs };
   }
 
@@ -4724,7 +4724,7 @@ function setupTabChangeListener() {
   const DEBUG = false;
   if (DEBUG) console.log('[tab-harbor] Setting up tab change listener');
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const listener = (message) => {
     if (DEBUG) console.log('[tab-harbor] Received message:', message);
 
     if (message.action === 'tabs-changed') {
@@ -4752,11 +4752,17 @@ function setupTabChangeListener() {
           updateBackToTopVisibility();
           if (DEBUG) console.log('[tab-harbor] Dashboard refreshed successfully');
         } catch (err) {
+          // Extension was reloaded/updated — stop listening to avoid repeated errors
+          if (err?.message?.includes('Extension context invalidated')) {
+            chrome.runtime.onMessage.removeListener(listener);
+            return;
+          }
           console.warn('[tab-harbor] Failed to refresh dashboard:', err);
         }
       }, 300); // Wait 300ms after last tab change
     }
-  });
+  };
+  chrome.runtime.onMessage.addListener(listener);
 }
 
 function mountDashboardRuntime() {
