@@ -91,16 +91,11 @@ async function notifyTabHarborPages(eventMeta = {}) {
   try {
     await chrome.runtime.sendMessage(message);
   } catch (err) {
-    const messageText = err && err.message ? err.message : String(err);
-    const noReceiverPatterns = [
-      /Receiving end does not exist/i,
-      /接收端不存在/,
-    ];
-    if (noReceiverPatterns.some((p) => p.test(messageText))) return;
-
-    if (notifyTabHarborPages._lastWarn !== messageText) {
-      notifyTabHarborPages._lastWarn = messageText;
-      console.warn("[tab-harbor bg] Error notifying Tab Harbor pages:", err);
+    if (err?.message && !err.message.includes("Receiving end does not exist")) {
+      console.warn(
+        "[tab-harbor bg] Error notifying Tab Harbor pages:",
+        err.message,
+      );
     }
   }
 }
