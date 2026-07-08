@@ -345,7 +345,7 @@ test('optional local config is loaded safely before app mount', () => {
 });
 
 test('background keeps the toolbar badge empty', () => {
-  assert.match(backgroundJs, /await chrome\.action\.setBadgeText\(\{\s*text:\s*["']{2}\s*\}\)/);
+  assert.match(backgroundJs, /await chrome\.action\.setBadgeText\(\{\s*text:\s*(?:''|"\")\s*\}\)/);
   assert.doesNotMatch(backgroundJs, /String\(count\)/);
 });
 
