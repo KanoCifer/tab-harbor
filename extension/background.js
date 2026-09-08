@@ -21,6 +21,26 @@ const NEW_TAB_GRACE_PERIOD_MS = 5000;
 const createdRecentlyAt = new Map(); // tabId -> timestamp
 const graceTimers = new Map(); // tabId -> timeout id, one-shot post-grace check
 
+// The grace period above defers dedup for freshly created tabs, so the
+// cleanup triggered by tabs.onCreated cannot yet see the full picture (a
+// pre-existing blank tab plus the fresh one yields only ONE dedupable blank).
+// Re-run the cleanup once after the grace expires; otherwise shielded
+// duplicate blank tabs stay open until some unrelated tab event happens to
+// trigger another cleanup. The timer only needs to outlive the few seconds
+// right after onCreated — well inside the service worker's post-event idle
+// lifetime — but it is unref'd so tests and worker shutdown never wait on it.
+const POST_GRACE_RECONCILE_DELAY_MS = NEW_TAB_GRACE_PERIOD_MS + 1000;
+let postGraceReconcileTimer = null;
+
+function schedulePostGraceReconcile() {
+  if (postGraceReconcileTimer != null) return;
+  postGraceReconcileTimer = setTimeout(() => {
+    postGraceReconcileTimer = null;
+    closeDuplicateNewTabs();
+  }, POST_GRACE_RECONCILE_DELAY_MS);
+  postGraceReconcileTimer.unref?.();
+}
+
 function getNewTabUrls() {
   return new Set([
     chrome.runtime.getURL("index.html"),
@@ -72,6 +92,7 @@ function isNewTabBlank(tab, newTabUrls) {
   // page: session restore creates tabs and discards them so they start asleep,
   // and a discarded tab may carry an empty/uncommitted url.
   if (tab?.discarded) return false;
+
   const knownNewTabUrls =
     newTabUrls instanceof Set
       ? newTabUrls
@@ -87,11 +108,14 @@ function isNewTabBlank(tab, newTabUrls) {
   // A tab whose URL is already an explicit new-tab page is not "in flight":
   // it IS a new tab, so it must count for duplicate cleanup immediately. Only
   // tabs with an empty/uncommitted URL (session-restore bursts that have not
-  // navigated yet) get the grace-period exemption.
+  // navigated yet) get the grace-period exemption. edge://newtab/ is Edge's
+  // mapping of the overridden new-tab page.
   const isExplicitNewTab =
     url === "chrome://newtab/" ||
+    url === "edge://newtab/" ||
     normalizedKnown.has(normalizedUrl) ||
     pendingUrl === "chrome://newtab/" ||
+    pendingUrl === "edge://newtab/" ||
     normalizedKnown.has(normalizedPendingUrl);
 
   if (!isExplicitNewTab && tab?.id != null) {
@@ -105,15 +129,17 @@ function isNewTabBlank(tab, newTabUrls) {
   if (
     pendingUrl &&
     !normalizedKnown.has(normalizedPendingUrl) &&
-    pendingUrl !== "chrome://newtab/"
+    pendingUrl !== "chrome://newtab/" &&
+    pendingUrl !== "edge://newtab/"
   ) {
     return false;
   }
-  return (
-    isExplicitNewTab ||
-    url === "" ||
-    (tab.status === "loading" && !url)
-  );
+  // Only close a tab whose blank state is positively known (a committed
+  // chrome://newtab/ or the dashboard page itself). A tab with an empty url
+  // and no pendingUrl is in an unknown state — most likely a restore-batch tab
+  // whose navigation has not been reported yet — and must never be closed on
+  // a guess, so "url is empty" alone is deliberately not a blank signal.
+  return isExplicitNewTab;
 }
 
 // Re-entrancy guard: onCreated, the post-grace timer, and onUpdated can all
@@ -142,13 +168,41 @@ async function closeDuplicateNewTabs() {
 
     if (blankTabs.length <= 1) return;
 
-    // Keep the active tab; if none is active, keep the one with the largest id (newest)
-    const activeTab = blankTabs.find((tab) => tab.active);
-    const toKeep =
-      activeTab || blankTabs.reduce((a, b) => (a.id > b.id ? a : b));
-    const toClose = blankTabs
-      .filter((tab) => tab.id !== toKeep.id)
-      .map((tab) => tab.id);
+    // Duplicate-new-tab cleanup is window-local. Keeping only one blank tab
+    // for the entire browser can remove another window's final tab and close
+    // that window. Keep the active (or newest) blank tab in every window.
+    const blankTabsByWindow = new Map();
+    for (const tab of blankTabs) {
+      const windowKey = tab?.windowId ?? '__unknown_window__';
+      if (!blankTabsByWindow.has(windowKey)) blankTabsByWindow.set(windowKey, []);
+      blankTabsByWindow.get(windowKey).push(tab);
+    }
+
+    // Match the dashboard by its normalized URL (same as isNewTabBlank), so a
+    // real dashboard tab — whose URL always carries the ?focus=1 query added by
+    // focus-redirect.js — is recognized and preserved even though the raw URL
+    // is not in newTabUrls. Without this, a non-active dashboard next to a
+    // genuinely blank new-tab page could be closed in favor of the blank.
+    const normalizedKnown = new Set(
+      [...newTabUrls].map((u) => normalizeNewTabUrl(u)),
+    );
+    const isDashboardTab = (tab) =>
+      normalizedKnown.has(normalizeNewTabUrl(String(tab.url || "")));
+
+    const toClose = [];
+    for (const tabsInWindow of blankTabsByWindow.values()) {
+      if (tabsInWindow.length <= 1) continue;
+      const activeTab = tabsInWindow.find((tab) => tab.active);
+      // No active blank tab: keep the Tab Harbor page when the group contains
+      // one, so the fallback below can never close the dashboard itself in
+      // favor of a genuinely blank new-tab page.
+      const toKeep = activeTab
+        || tabsInWindow.find(isDashboardTab)
+        || tabsInWindow.reduce((a, b) => (a.id > b.id ? a : b));
+      for (const tab of tabsInWindow) {
+        if (tab.id !== toKeep.id) toClose.push(tab.id);
+      }
+    }
 
     if (toClose.length > 0) await chrome.tabs.remove(toClose);
   } catch (err) {
@@ -179,6 +233,9 @@ async function notifyTabHarborPages(eventMeta = {}) {
     source: eventMeta.source || "tabs.changed",
     triggerTabId: eventMeta.triggerTabId ?? null,
   };
+  if (eventMeta.replacedTabId != null) {
+    message.replacedTabId = eventMeta.replacedTabId;
+  }
 
   try {
     await chrome.runtime.sendMessage(message);
@@ -211,6 +268,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   updateBadge();
   notifyTabHarborPages({ source: "tabs.onCreated", triggerTabId: tab?.id });
   closeDuplicateNewTabs();
+  schedulePostGraceReconcile();
 });
 
 // Update badge and notify Tab Harbor pages whenever a tab is closed
@@ -234,7 +292,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   // onCreated; this is a second, URL-driven opportunity.
   if (changeInfo?.url) {
     const urls = getNewTabUrls();
-    const isNewTab = changeInfo.url === "chrome://newtab/" || urls.has(changeInfo.url);
+    const isNewTab =
+      changeInfo.url === "chrome://newtab/" ||
+      changeInfo.url === "edge://newtab/" ||
+      urls.has(changeInfo.url);
     if (isNewTab) closeDuplicateNewTabs();
   }
 });
@@ -242,9 +303,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // A tab can be replaced with a different tab id (OAuth/redirect flows,
 // prerendering). Without this, pages keep chips for tab ids that no longer
 // exist, and actions on those stale chips corrupt grouping state.
-chrome.tabs.onReplaced.addListener((addedTabId) => {
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  createdRecentlyAt.delete(removedTabId);
+  clearGraceExpiryCheck(removedTabId);
   updateBadge();
-  notifyTabHarborPages({ source: "tabs.onReplaced", triggerTabId: addedTabId });
+  notifyTabHarborPages({
+    source: "tabs.onReplaced",
+    triggerTabId: addedTabId,
+    replacedTabId: removedTabId,
+  });
 });
 
 // ─── Initial run ─────────────────────────────────────────────────────────────
@@ -258,6 +325,18 @@ globalThis.TabHarborBackground = {
   getNewTabUrls,
   isNewTabBlank,
   closeDuplicateNewTabs,
+  // Test seam: settle the armed post-grace reconciliation right now AND
+  // advance past the grace window, so tests observe the eventual cleanup
+  // without real timers. Clearing the creation registry mirrors reality:
+  // once the grace expires, isNewTabBlank stops shielding those tabs.
+  async runPostGraceReconcileForTest() {
+    if (postGraceReconcileTimer != null) {
+      clearTimeout(postGraceReconcileTimer);
+      postGraceReconcileTimer = null;
+    }
+    createdRecentlyAt.clear();
+    await closeDuplicateNewTabs();
+  },
   // Test-only: reset the re-entrancy guard between test cases.
   _resetDuplicateCloseGuard: () => {
     duplicateCloseInFlight = false;

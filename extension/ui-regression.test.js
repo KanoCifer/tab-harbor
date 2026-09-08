@@ -194,8 +194,30 @@ test('saved tabs top nav supports session reordering and card jump highlighting'
 test('tab sessions close selected tabs by id after storage save instead of fuzzy url matching', () => {
   assert.match(tabSessionsJs, /const SAVED_TAB_SESSIONS_KEY = 'savedTabSessions'/);
   assert.match(runtimeJs, /await saveTabsAsSession\(/);
-  assert.match(runtimeJs, /chrome\.tabs\.remove\(tabIdsToClose\)/);
+  assert.match(runtimeJs, /await closeSavedSessionSourceTabs\(tabIdsToClose\);/);
   assert.doesNotMatch(runtimeJs, /closeTabsByUrls\(selected/);
+});
+
+test('close feedback and saved-session copy use confirmed close results', () => {
+  assert.match(runtimeJs, /async function closeSavedSessionSourceTabs\(tabIds = \[\]\) \{[\s\S]*await closeTabsSafely\(tabIds, \{ playSound: false \}\);/);
+  assert.match(runtimeJs, /const closedCount = closeResult\.closedCount;[\s\S]{0,500}closedTabsFromGroup/);
+  assert.doesNotMatch(runtimeJs, /const closedCount = group\.isChromeGroup \? closeResult\.closedCount : urls\.length;/);
+  assert.match(runtimeJs, /const closeResult = chromeGroup[\s\S]*toastNoDuplicatesClosed/);
+  assert.match(runtimeJs, /if \(action === 'close-all-open-tabs'\) \{[\s\S]{0,200}if \(cardActionInFlight\) return;[\s\S]{0,200}await runWithSuppressedRefresh\(async \(\) => \{[\s\S]{0,1000}const closeResult = await closeTabsByUrlsSafely\(allUrls, \{ playSound: false \}\);[\s\S]{0,1000}toastTabsClosedWithRemaining/);
+  assert.match(runtimeJs, /\[tab-harbor\] Could not close all tabs:[\s\S]{0,200}toastTabsCloseFailed/);
+  const closeDomainHandler = runtimeJs.slice(
+    runtimeJs.indexOf("if (action === 'close-domain-tabs')"),
+    runtimeJs.indexOf('// ---- Save a whole domain group', runtimeJs.indexOf("if (action === 'close-domain-tabs')"))
+  );
+  assert.match(closeDomainHandler, /finally \{\s*\/\/ A rejected close\/query\/render[\s\S]{0,250}window\.__suppressAutoRefreshUntil = 0;\s*cardActionInFlight = false;/);
+  const dedupHandler = runtimeJs.slice(
+    runtimeJs.indexOf("if (action === 'dedup-keep-one')"),
+    runtimeJs.indexOf('// ---- Close ALL open tabs', runtimeJs.indexOf("if (action === 'dedup-keep-one')"))
+  );
+  assert.match(dedupHandler, /finally \{\s*\/\/ The close operation or the immediate re-render can reject\.[\s\S]{0,250}window\.__suppressAutoRefreshUntil = 0;\s*cardActionInFlight = false;/);
+  assert.match(i18nJs, /toastSessionSaved: 'Saved \{count\} tabs; closed \{closedCount\} originals'/);
+  assert.match(i18nJs, /toastTabsClosedWithRemaining: 'Closed \{closedCount\} tabs; \{remainingCount\} remain open'/);
+  assert.match(i18nJs, /toastTabsCloseFailed: 'Could not close tabs'/);
 });
 
 test('new tab dashboard scopes visible open tabs to its own browser window', () => {
@@ -369,8 +391,12 @@ test('background keeps the toolbar badge empty', () => {
   assert.doesNotMatch(backgroundJs, /String\(count\)/);
 });
 
-test('background notifies pages when a tab is replaced (stale chip root cause)', () => {
-  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId\) => \{\s*updateBadge\(\);\s*notifyTabHarborPages\(\{ source: "tabs\.onReplaced", triggerTabId: addedTabId \}\)/);
+test('background clears replaced-tab state and notifies pages (stale chip root cause)', () => {
+  // The onReplaced listener releases both the created-recently record and any
+  // pending grace-expiry timer for the removed tab, then broadcasts to pages.
+  // clearGraceExpiryCheck was added by the merge resolution; the assertion must
+  // tolerate it between the record delete and the badge update.
+  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId, removedTabId\) => \{\s*createdRecentlyAt\.delete\(removedTabId\);\s*(?:clearGraceExpiryCheck\(removedTabId\);\s*)?updateBadge\(\);\s*notifyTabHarborPages\(\{\s*source:\s*"tabs\.onReplaced",\s*triggerTabId:\s*addedTabId,\s*replacedTabId:\s*removedTabId,\s*\}\)/);
 });
 
 test('manifest keeps only permissions required by the shipped runtime', () => {
@@ -610,6 +636,12 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(html, /<script src="focus-redirect\.js"><\/script>[\s\S]*<link rel="preconnect"/);
   assert.match(html, /id="headerSearchInput"[\s\S]*autofocus>/);
   assert.match(runtimeJs, /function isTabHarborNewTabUrl\(/);
+  // The duplicate count and close-extras banner must recognize the new-tab URL
+  // of every supported browser (Chrome and Edge), or tabs keep their native
+  // new-tab URL when the auto-focus redirect is disabled and become invisible
+  // to the dedup count.
+  assert.match(runtimeJs, /url === 'chrome:\/\/newtab\/' \|\| url === 'edge:\/\/newtab\/'/);
+  assert.match(backgroundJs, /url === "edge:\/\/newtab\/"/);
   assert.match(runtimeJs, /function normalizeNewTabUrlForComparison\(/);
   assert.match(css, /\.header-search-suggestions\s*\{/);
   assert.match(css, /\.header-search-suggestion-row\s*\{/);
@@ -623,8 +655,8 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.group-nav-button\s*\{[\s\S]*width:\s*40px;[\s\S]*height:\s*40px;/);
   assert.match(css, /\.group-nav-button::after\s*\{[\s\S]*background:\s*var\(--tooltip-surface\);[\s\S]*color:\s*var\(--tooltip-text\);[\s\S]*border:\s*1px solid var\(--tooltip-border\);/);
   assert.match(css, /\.tab-cleanup-banner\s*\{[\s\S]*var\(--theme-accent-soft\)[\s\S]*border:\s*1px solid var\(--theme-accent-muted\);/);
-  assert.match(css, /\.tab-cleanup-icon svg\s*\{[\s\S]*color:\s*var\(--theme-accent-strong\);/);
-  assert.match(css, /\.tab-cleanup-btn\s*\{[\s\S]*background:\s*var\(--banner-action-bg\);[\s\S]*color:\s*var\(--banner-action-text\);/);
+  assert.match(css, /\.tab-cleanup-banner\s*\{[\s\S]*border-radius:\s*999px;[\s\S]*flex:\s*0 0 auto;/);
+  assert.match(css, /\.tab-cleanup-btn\s*\{[\s\S]*border-radius:\s*999px;/);
   assert.match(css, /\.tab-cleanup-btn:hover\s*\{[\s\S]*background:\s*var\(--banner-action-bg-hover\);/);
   assert.match(css, /\.duplicate-count-badge\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border:\s*1px solid var\(--workspace-chip-border\);/);
   assert.match(css, /\.action-btn\.close-tabs\s*\{[\s\S]*border-color:\s*var\(--workspace-chip-border\);[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--workspace-chip-bg\)\s+92%,\s*var\(--card-bg\)\s+8%\s*\);[\s\S]*border-radius:\s*8px;[\s\S]*min-height:\s*28px;/);
@@ -1082,23 +1114,34 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /async function openSavedTabsInCurrentWindow\(tabs = \[\]\)/);
   assert.match(runtimeJs, /await chrome\.tabs\.create\(\{\s*windowId: currentWindowId,\s*url: firstTab\.url,\s*active: true,\s*\}\)/);
   assert.match(runtimeJs, /await chrome\.windows\.create\(\{\s*url: firstTab\.url,\s*focused: true,\s*\}\)/);
+  assert.match(runtimeJs, /function scheduleRestoredSessionBackgroundDiscards\(backgroundTabDiscards = \[\]\)/);
   assert.match(runtimeJs, /async function restoreSavedTabToBrowser\(tabUrl\)/);
-  assert.match(runtimeJs, /const \{ windowId \} = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
+  assert.match(runtimeJs, /const opened = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
+  assert.match(runtimeJs, /scheduleRestoredSessionBackgroundDiscards\(opened\.backgroundTabDiscards\);/);
   assert.match(sessionManagerJs, /runtime\.restoreSavedTabToBrowser/);
   // Saved sessions re-create native Chrome groups (fresh groups with the
   // recorded title/color, ordered tabs) after the tabs are opened.
   assert.match(runtimeJs, /const \{ state: nextSessionGroups, chromeGroupPlans \} = runtimeCreateRestoredSessionGroups\(\{/);
   assert.match(runtimeJs, /await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
   assert.match(runtimeJs, /async function restoreChromeGroupsForSession\(plans, windowId\) \{/);
-  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
+  assert.match(runtimeJs, /groupId = await chrome\.tabs\.group\(groupOptions\);/);
   // Chrome creates the fresh group in the CALLER's window by default, which
   // would drag tabs created in the restore target window across windows;
   // createProperties.windowId pins the new group to the target window so a
   // new-window restore keeps chrome-group tabs in place with the other tabs.
   assert.match(runtimeJs, /const groupOptions = windowId != null\s*\? \{ tabIds: planTabIds, createProperties: \{ windowId: Number\(windowId\) \} \}\s*: \{ tabIds: planTabIds \};/);
-  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
+  assert.match(runtimeJs, /groupId = await chrome\.tabs\.group\(groupOptions\);/);
   assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{/);
   assert.match(runtimeJs, /reorderGroupedTabs\(groupId, planTabIds\.map\(String\), windowId\)/);
+  // A group may be created but fail its metadata write. That partial success
+  // reaches the session manager instead of being lost in a console warning.
+  assert.match(runtimeJs, /chromeGroupRestore = await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
+  assert.match(runtimeJs, /scheduleRestoredSessionBackgroundDiscards\(backgroundTabDiscards\);/);
+  assert.match(runtimeJs, /result\.failures\.push\(\{ stage: 'metadata', groupId: Number\(groupId\), title, tabIds: planTabIds \}\);/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupCreateWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupMetadataWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupOrderWarning/);
 });
 
 test('saved tabs top nav supports icon and name display modes', () => {
@@ -1330,7 +1373,11 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupJs, /GROUP_LABEL_OVERRIDES_KEY/);
   assert.match(popupJs, /popupState\.groupLabelOverrides\[group\.domain\]/);
   assert.match(popupJs, /popupIcons\.getPrimaryDomain \? popupIcons\.getPrimaryDomain\(hostname\) : hostname/);
-  assert.match(popupJs, /const mergedGroups = \[\.\.\.sessionGroupsList, \.\.\.sortedAutomatic\];/);
+  // Popup recognizes live user Chrome groups first, while the session-only
+  // mirror map keeps dashboard-created domain mirrors out of those cards.
+  assert.match(popupJs, /const CHROME_GROUP_SESSION_MAP_KEY = 'chromeTabGroupsSessionMap';/);
+  assert.match(popupJs, /!managedChromeGroupIds\.has\(nativeGroupId\)/);
+  assert.match(popupJs, /const mergedGroups = \[\.\.\.nativeChromeGroups, \.\.\.sessionGroupsList, \.\.\.sortedAutomatic\];/);
   assert.match(popupJs, /ungroupedTabs\.length > 0/);
   // A failed refresh keeps the previous snapshot instead of rejecting.
   assert.match(popupJs, /console\.warn\('\[tab-harbor popup\] refresh failed:'/);
