@@ -37,6 +37,7 @@ const {
   normalizeSessionGroups,
   pruneSessionGroups,
   renameSessionGroup,
+  transferSessionGroupAssignment: runtimeTransferSessionGroupAssignment,
 } = globalThis.TabOutSessionGroups || {};
 
 const {
@@ -58,8 +59,14 @@ const {
   isChromeTabGroupsEnabled,
   populateChromeGroupMap,
   queryExistingChromeGroups,
+  queryUserChromeGroups,
+  getManagedChromeGroupIds,
+  getChromeGroupsLastError,
+  reorderGroupedTabs,
+  muteChromeGroupEvents,
   setImportMode,
   subscribeToChromeTabGroupChanges,
+  assignGroupColor: runtimeAssignGroupColor,
 } = globalThis.TabOutChromeTabGroups || {};
 
 const {
@@ -81,8 +88,21 @@ const {
 } = globalThis.TabOutBackgroundImage || {};
 
 const {
+  SEARCH_ENGINE_PRESETS: runtimeSearchEnginePresets,
+  buildSearchUrlForQuery: runtimeBuildSearchUrlForQuery,
   getSavedSessionRestoreMode: runtimeGetSavedSessionRestoreMode,
+  getSearchEngine: runtimeGetSearchEngine,
 } = globalThis.TabOutThemeControls || {};
+
+const SEARCH_ENGINE_LABEL_KEYS = {
+  google: 'searchEngineGoogle',
+  bing: 'searchEngineBing',
+  baidu: 'searchEngineBaidu',
+  sogou: 'searchEngineSogou',
+  duckduckgo: 'searchEngineDuckDuckGo',
+  brave: 'searchEngineBrave',
+  yandex: 'searchEngineYandex',
+};
 
 const {
   getCanonicalTabUrl: runtimeGetCanonicalTabUrl,
@@ -108,9 +128,39 @@ const {
 // Visible open tabs for this dashboard window — populated by fetchOpenTabs()
 let openTabs = [];
 let allOpenTabIds = [];
+// A failed Chrome query must never be interpreted as proof that every tab was
+// closed. Session-group pruning is destructive, so it requires this snapshot.
+let hasAuthoritativeOpenTabsSnapshot = false;
+// Keep the read-prune-write path ordered with explicit group saves. Without
+// this, an older load can overwrite a just-saved manual assignment.
+let sessionGroupsMutationQueue = Promise.resolve();
+let sessionGroupTabReplacementListenerAttached = false;
+const pendingSessionGroupTabReplacementMigrations = new Set();
+const pendingSleepTabReplacementFallbacks = new Map();
+let sleepTabReplacementFallbackCleanupTimer = null;
 let sessionGroupsState = normalizeSessionGroups ? normalizeSessionGroups() : { groups: [], assignments: {} };
 const MANUAL_GROUP_PREFIX = '__session_group__:';
+const CHROME_GROUP_PREFIX = '__chrome_group__:';
+// Chrome tab group color names → dashboard accent colors (used to tint the
+// card name and the tab rows' drag handles of user-created Chrome group cards).
+const CHROME_GROUP_COLOR_MAP = {
+  grey: '#8f9a9f',
+  blue: '#5b8def',
+  red: '#d98080',
+  yellow: '#d9b45b',
+  green: '#7ba05b',
+  pink: '#cf7a9e',
+  purple: '#9a7acf',
+  cyan: '#5ba8b3',
+  orange: '#d98a4b',
+};
 const PAGE_CHIP_DRAG_DEBUG = false;
+const PAGE_CHIP_EDGE_SCROLL_ZONE = 64;
+const PAGE_CHIP_EDGE_SCROLL_SPEED = 12;
+// Merged Chrome groups cycle through the accent palette instead of always
+// landing on the first color (grey). Starts past grey so the FIRST merge is
+// already visibly colored, then rotates through red/green/pink/...
+let chromeGroupMergeColorIndex = 1;
 const SESSION_GROUPS_KEY = 'sessionGroups';
 const IMPORTED_CHROME_GROUPS_KEY = 'importedChromeSessionGroups';
 let groupOrderState = normalizeGroupOrderState ? normalizeGroupOrderState() : { sessionOrder: [], pinnedOrder: [], pinEnabled: false };
@@ -124,6 +174,20 @@ let draggedGroupId = '';
 let dragStartPoint = null;
 let suppressJumpUntil = 0;
 let suppressPageChipClickUntil = 0;
+// Handle-click selection: clicking a row's drag handle toggles it into the
+// selection; dragging a selected row then reorders the whole selection
+// together within its group.
+let selectedPageChipIds = new Set();
+// Cards whose "+N more" overflow rows were expanded. Kept for the session so
+// re-renders after a drag (or any other refresh) do not silently re-collapse
+// the rows the user opened.
+let expandedPageChipGroupKeys = new Set();
+// Last toggled/selected row id — the anchor for Shift+click / Shift+Space
+// range selection within the same card.
+let pageChipSelectionAnchorId = '';
+// Suppresses the synthesized click (detail 0 on some touch/pen devices) that
+// follows a pointerup toggle, so a tap does not toggle the row twice.
+let pageChipPointerToggleGuard = { key: '', until: 0 };
 let draggedGroupButtonEl = null;
 let dragPlaceholderEl = null;
 let draggedDrawerItemId = '';
@@ -135,6 +199,14 @@ let draggedPageChipEl = null;
 let pageChipDragState = null;
 let pageChipPlaceholderEl = null;
 let pageChipNewGroupSlotEl = null;
+let pageChipAutoScrollRaf = 0;
+let pageChipCommitInFlight = false;
+let batchActionInFlight = false;
+// Card-level (per-domain / section-header) actions run without the batch
+// bar's begin/finish wrapper, so they get their own re-entrancy guard:
+// double-clicks or rapid keyboard activation must not run the same
+// side-effecting action twice (merge would re-create the group).
+let cardActionInFlight = false;
 let tabSessionPickerState = {
   open: false,
   mode: 'new',
@@ -155,6 +227,29 @@ let chromeTabGroupsImportTimer = null;
 let chromeTabGroupsUnsubscribe = null;
 let chromeTabGroupsImportInFlight = false;
 let suppressChromeTabGroupsImportUntil = 0;
+// Search-field suggestion panel state. openSuggestions tracks visibility;
+// suggestionHistoryCache debounces chrome.history lookups while the panel is
+// open so we never query on every keystroke.
+let searchSuggestionsOpen = false;
+let searchSuggestionsQuery = '';
+let searchSuggestionsSelectedIndex = -1;
+let searchSuggestionsRows = [];
+let searchSuggestionsHistoryCache = null;
+let searchSuggestionsHistoryCacheTime = 0;
+let searchSuggestionsDebounceTimer = null;
+let searchSuggestionsFocusGuardUntil = 0;
+// True while the input method editor is composing a candidate in the search
+// field (compositionstart fired, compositionend not yet). Enter during
+// composition confirms the IME candidate and must not submit the search.
+let searchSuggestionsIsComposing = false;
+// True while the Enter keydown handler has already started the search
+// navigation, so the following form submit does not run it a second time.
+let searchSubmitInFlight = false;
+// Incremented whenever the suggestion panel is invalidated (search submit,
+// outside click, Escape). In-flight refreshSearchSuggestions calls compare
+// their captured generation against this and discard stale results, so their
+// chrome.* calls never contend with a navigation's chrome.* calls.
+let searchSuggestionsGeneration = 0;
 let currentDashboardTabId = null;
 let currentDashboardWindowId = null;
 let dashboardStartupTabChangeIgnoreUntil = 0;
@@ -298,6 +393,11 @@ function reorderGroupTabsByStoredUrls(tabs, groupKey) {
 
 function getOrderedUniqueTabsForGroup(group) {
   const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
+  // User-created Chrome group cards always follow the native strip order
+  // (tabs come from queryUserChromeGroups, already strip-ordered). Applying
+  // the dashboard's stored tab order would keep a stale snapshot after the
+  // user reorders the group in the browser (C22).
+  if (group?.isChromeGroup) return tabs.slice();
   return reorderGroupTabsByStoredUrls(tabs, group?.domain);
 }
 
@@ -401,7 +501,11 @@ async function submitGroupRenameEditor() {
   }
 
   try {
-    if (manualGroupId) {
+    if (group.isChromeGroup && group.chromeGroupId != null) {
+      // Renaming a user-created Chrome group card renames the native group.
+      if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+      await chrome.tabGroups.update(Number(group.chromeGroupId), { title: cleanName });
+    } else if (manualGroupId) {
       const nextState = renameSessionGroup(sessionGroupsState, manualGroupId, cleanName);
       await saveSessionGroups(nextState);
     } else {
@@ -444,6 +548,95 @@ function getTabIdsForGroupChip(groupKey, chipSortId) {
     .filter(Number.isFinite);
 }
 
+/**
+ * findGroupKeyForChip(chipId)
+ *
+ * Locates the domain group that currently owns a chip's tabs, so a drag
+ * selection spanning several cards can move every selected row from its own
+ * source group into the target.
+ */
+function findGroupKeyForChip(chipId) {
+  const key = String(chipId || '');
+  if (!key) return '';
+  for (const group of domainGroups) {
+    if ((group.tabs || []).some(tab => getTabOrderTokens(tab).includes(key))) {
+      return String(group.domain || '');
+    }
+  }
+  return '';
+}
+
+/**
+ * orderChipIdsByDom(ids)
+ *
+ * Returns the given chip ids ordered by their current visual (DOM) position,
+ * card by card. Same-group reorders and cross-group moves then share the same
+ * "visual order" semantics for a batch (a batch never flips the order the user
+ * sees, regardless of the order rows were toggled).
+ */
+function orderChipIdsByDom(ids) {
+  const set = new Set((ids || []).map(String).filter(Boolean));
+  if (!set.size) return [];
+  const ordered = [];
+  const seen = new Set();
+  document.querySelectorAll('.mission-card').forEach(card => {
+    card.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
+      const id = String(row.dataset.chipSortId || '');
+      if (set.has(id) && !seen.has(id)) {
+        ordered.push(id);
+        seen.add(id);
+      }
+    });
+  });
+  // Ids with no rendered row (rare) keep their original relative order at the end.
+  for (const id of set) {
+    if (!seen.has(id)) ordered.push(id);
+  }
+  return ordered;
+}
+
+/**
+ * getMovingPageChipIds()
+ *
+ * The chips participating in the current drag: the whole highlight-only
+ * selection when the dragged row is part of it, otherwise just the dragged
+ * row. Same-group reorders and cross-group moves all use this set, always in
+ * visual (DOM) order.
+ */
+function getMovingPageChipIds() {
+  const draggedChipId = String(draggedPageChipId || '');
+  // Prefer the snapshot captured when the drag armed — the selection must
+  // not change mid-drag, so commit-time logic uses the same set throughout.
+  let ids;
+  if (pageChipDragState?.movingChipIds?.length) {
+    ids = [...pageChipDragState.movingChipIds];
+  } else if (selectedPageChipIds.size > 0 && selectedPageChipIds.has(draggedChipId)) {
+    ids = [...selectedPageChipIds].map(String).filter(Boolean);
+  } else {
+    ids = [draggedChipId].filter(Boolean);
+  }
+  return orderChipIdsByDom(ids);
+}
+
+/**
+ * collectMovingTabIds(movingChipIds, fallbackGroupKey)
+ *
+ * Returns { tabIds, groupsById } for every moving chip, resolving each chip's
+ * own source group (chips from other cards are collected from their cards).
+ */
+function collectMovingTabIds(movingChipIds, fallbackGroupKey = '') {
+  const tabIds = [];
+  const groupsById = {};
+  for (const chipId of movingChipIds) {
+    const chipGroupKey = findGroupKeyForChip(chipId) || String(fallbackGroupKey || '');
+    if (!chipGroupKey) continue;
+    groupsById[chipGroupKey] = groupsById[chipGroupKey] || new Set();
+    groupsById[chipGroupKey].add(String(chipId));
+    tabIds.push(...getTabIdsForGroupChip(chipGroupKey, chipId));
+  }
+  return { tabIds, groupsById };
+}
+
 function getOrderedIdsForGroup(groupKey) {
   const group = getDomainGroupByKey(groupKey);
   return getOrderedUniqueTabsForGroup(group).map(tab => getPrimaryTabOrderToken(tab)).filter(Boolean);
@@ -458,6 +651,36 @@ function buildOrderedIdsFromList(listEl, draggedId) {
       return node.dataset?.chipSortId || '';
     })
     .filter(Boolean);
+}
+
+/**
+ * buildBatchOrderedIdsFromList(listEl, movingIds)
+ *
+ * Rebuilds the list order with every moving chip placed consecutively at the
+ * placeholder (drop) position, preserving their relative order.
+ */
+function buildBatchOrderedIdsFromList(listEl, movingIds) {
+  if (!listEl) return [];
+  const movingSet = new Set((movingIds || []).map(String).filter(Boolean));
+  const children = [...listEl.children];
+  const rest = [];
+  const moving = [];
+  for (const node of children) {
+    if (node === pageChipPlaceholderEl) continue;
+    const id = node.dataset?.chipSortId || '';
+    if (id && movingSet.has(id)) moving.push(id);
+    else if (id) rest.push(id);
+  }
+  const placeholderIdx = children.findIndex(node => node === pageChipPlaceholderEl);
+  // Count only id-bearing nodes that will stay in the final order, so non-chip
+  // children (e.g. the overflow "+N more" row) cannot skew the insert index.
+  const dropPos = placeholderIdx === -1
+    ? rest.length
+    : children.slice(0, placeholderIdx)
+        .filter(n => n !== pageChipPlaceholderEl && rest.includes(String(n.dataset?.chipSortId || '')))
+        .length;
+  rest.splice(dropPos, 0, ...moving);
+  return rest;
 }
 
 function logPageChipDragDebug(stage, details = {}) {
@@ -611,13 +834,6 @@ function ensureManualDropGroup(state, targetGroupKey) {
   };
 }
 
-/**
- * fetchOpenTabs()
- *
- * Reads all currently open browser tabs directly from Chrome.
- * Sets the extensionId flag so we can identify Tab Harbor's own pages.
- */
-
 /* ----------------------------------------------------------------
    Hitokoto helper
    ---------------------------------------------------------------- */
@@ -706,13 +922,20 @@ function warmHitokotoCacheInBackground() {
   }).catch(() => { /* silently fail */ });
 }
 
+/**
+ * fetchOpenTabs()
+ *
+ * Reads the open tabs of the dashboard's window directly from Chrome
+ * (all windows when the dashboard window id is unavailable). Flags Tab
+ * Harbor's own pages via isTabOut so duplicate new tabs can be detected.
+ */
 async function fetchOpenTabs() {
+  await waitForSessionGroupTabReplacementMigrations();
   try {
-    const newtabUrl = window.location.href;
-
     const currentWindowId = await getDashboardWindowIdForOpenTabs();
     const tabs = await chrome.tabs.query({});
     allOpenTabIds = tabs.map(tab => tab?.id).filter(tabId => tabId != null);
+    hasAuthoritativeOpenTabsSnapshot = true;
     const visibleTabs = currentWindowId == null
       ? tabs
       : tabs.filter(t => t.windowId === currentWindowId);
@@ -733,22 +956,173 @@ async function fetchOpenTabs() {
         title:    suspended.title || t.title,
         windowId: t.windowId,
         active:   t.active,
+        pinned:   Boolean(t.pinned),
+        // Native Chrome tab group membership + strip position: used to render
+        // user-created Chrome groups as first-class cards and to order cards
+        // like the tab strip.
+        groupId:  Number.isInteger(t.groupId) && t.groupId >= 0 ? t.groupId : -1,
+        index:    Number.isInteger(t.index) ? t.index : 0,
         favIconUrl: t.favIconUrl || '',
         isSuspended: Boolean(suspended.isSuspended),
         discarded: t.discarded || false,
         // Flag Tab Harbor's own pages so we can detect duplicate new tabs
-        isTabOut: rawUrl === newtabUrl || rawUrl === 'chrome://newtab/',
+        isTabOut: isTabHarborNewTabUrl(rawUrl),
       };
     });
-  } catch {
-    // chrome.tabs API unavailable (shouldn't happen in an extension page)
+    return true;
+  } catch (error) {
+    // Do not let a transient API failure turn into a persisted "all tabs are
+    // gone" snapshot. The next successful refresh will safely prune stale ids.
     openTabs = [];
     allOpenTabIds = [];
+    hasAuthoritativeOpenTabsSnapshot = false;
+    console.warn('[tab-harbor] fetchOpenTabs failed; retaining session groups:', error);
+    return false;
   }
 }
 
 function getOpenTabIdsForSessionPruning() {
   return allOpenTabIds.length > 0 ? allOpenTabIds : openTabs.map(tab => tab.id);
+}
+
+function enqueueSessionGroupsMutation(operation) {
+  const result = sessionGroupsMutationQueue.then(operation, operation);
+  // Do not poison later mutations if this one fails, while returning the real
+  // result to the caller that initiated the operation.
+  sessionGroupsMutationQueue = result.catch(() => {});
+  return result;
+}
+
+function pruneExpiredSleepTabReplacementFallbacks(now = Date.now()) {
+  for (const [tabId, fallback] of pendingSleepTabReplacementFallbacks.entries()) {
+    if (!fallback || fallback.expiresAt <= now) {
+      pendingSleepTabReplacementFallbacks.delete(tabId);
+    }
+  }
+}
+
+function scheduleSleepTabReplacementFallbackCleanup() {
+  if (sleepTabReplacementFallbackCleanupTimer != null) {
+    clearTimeout(sleepTabReplacementFallbackCleanupTimer);
+    sleepTabReplacementFallbackCleanupTimer = null;
+  }
+
+  let nextExpiry = Infinity;
+  for (const fallback of pendingSleepTabReplacementFallbacks.values()) {
+    if (Number.isFinite(fallback?.expiresAt)) {
+      nextExpiry = Math.min(nextExpiry, fallback.expiresAt);
+    }
+  }
+  if (!Number.isFinite(nextExpiry)) return;
+
+  const cleanupTimer = setTimeout(() => {
+    sleepTabReplacementFallbackCleanupTimer = null;
+    pruneExpiredSleepTabReplacementFallbacks();
+    scheduleSleepTabReplacementFallbackCleanup();
+  }, Math.max(0, nextExpiry - Date.now()));
+  // Browsers return a numeric timer id; Node returns a Timeout object. The
+  // latter must not keep standalone regression tests alive for 15 seconds.
+  if (typeof cleanupTimer?.unref === 'function') cleanupTimer.unref();
+  sleepTabReplacementFallbackCleanupTimer = cleanupTimer;
+}
+
+function rememberSleepTabReplacementFallback(tabId) {
+  pruneExpiredSleepTabReplacementFallbacks();
+  const numericTabId = Number(tabId);
+  if (!Number.isFinite(numericTabId) || numericTabId < 0) return;
+  const groupId = sessionGroupsState?.assignments?.[String(numericTabId)];
+  if (!groupId) return;
+  const group = sessionGroupsState.groups.find(entry => entry.id === groupId);
+  if (!group) return;
+
+  pendingSleepTabReplacementFallbacks.set(String(numericTabId), {
+    groupId,
+    group: { ...group },
+    expiresAt: Date.now() + 15000,
+  });
+  scheduleSleepTabReplacementFallbackCleanup();
+}
+
+function getSleepTabReplacementFallback(tabId) {
+  const key = String(Number(tabId));
+  const fallback = pendingSleepTabReplacementFallbacks.get(key);
+  if (!fallback) return null;
+  if (fallback.expiresAt <= Date.now()) {
+    pendingSleepTabReplacementFallbacks.delete(key);
+    scheduleSleepTabReplacementFallbackCleanup();
+    return null;
+  }
+  return fallback;
+}
+
+function clearSleepTabReplacementFallback(tabId) {
+  pendingSleepTabReplacementFallbacks.delete(String(Number(tabId)));
+  scheduleSleepTabReplacementFallbackCleanup();
+}
+
+async function migrateSessionGroupAssignmentForTabReplacement(addedTabId, removedTabId) {
+  const targetId = Number(addedTabId);
+  const sourceId = Number(removedTabId);
+  if (typeof runtimeTransferSessionGroupAssignment !== 'function'
+    || !Number.isFinite(targetId) || targetId < 0
+    || !Number.isFinite(sourceId) || sourceId < 0
+    || targetId === sourceId) {
+    return false;
+  }
+  const fallback = getSleepTabReplacementFallback(sourceId);
+
+  return enqueueSessionGroupsMutation(async () => {
+    const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
+    let currentState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
+    // A successful sleep can race a browser replacement event. If an earlier
+    // refresh already pruned the old id, restore only the just-captured manual
+    // membership before applying Chrome's authoritative replacement relation.
+    if (!currentState.assignments[String(sourceId)] && fallback) {
+      const hasGroup = currentState.groups.some(group => group.id === fallback.groupId);
+      currentState = {
+        ...currentState,
+        groups: hasGroup ? currentState.groups : [...currentState.groups, fallback.group],
+        assignments: { ...currentState.assignments, [String(sourceId)]: fallback.groupId },
+      };
+    }
+
+    const nextState = runtimeTransferSessionGroupAssignment(currentState, sourceId, targetId);
+    const moved = Boolean(currentState.assignments[String(sourceId)])
+      && !nextState.assignments[String(sourceId)]
+      && Boolean(nextState.assignments[String(targetId)]);
+    if (!moved) return false;
+
+    sessionGroupsState = nextState;
+    await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: nextState });
+    clearSleepTabReplacementFallback(sourceId);
+    return true;
+  });
+}
+
+function queueSessionGroupTabReplacementMigration(addedTabId, removedTabId) {
+  const task = migrateSessionGroupAssignmentForTabReplacement(addedTabId, removedTabId)
+    .catch(error => {
+      console.warn('[tab-harbor] Could not preserve manual group across tab replacement:', error);
+      return false;
+    });
+  pendingSessionGroupTabReplacementMigrations.add(task);
+  task.finally(() => pendingSessionGroupTabReplacementMigrations.delete(task));
+  return task;
+}
+
+async function waitForSessionGroupTabReplacementMigrations() {
+  const pending = [...pendingSessionGroupTabReplacementMigrations];
+  if (pending.length > 0) await Promise.allSettled(pending);
+}
+
+function ensureSessionGroupTabReplacementSubscription() {
+  if (sessionGroupTabReplacementListenerAttached) return;
+  const onReplaced = globalThis.chrome?.tabs?.onReplaced;
+  if (!onReplaced || typeof onReplaced.addListener !== 'function') return;
+  onReplaced.addListener((addedTabId, removedTabId) => {
+    void queueSessionGroupTabReplacementMigration(addedTabId, removedTabId);
+  });
+  sessionGroupTabReplacementListenerAttached = true;
 }
 
 async function queryTabsForDashboardWindow() {
@@ -763,18 +1137,35 @@ async function queryTabsForDashboardWindow() {
 }
 
 async function loadSessionGroups(openTabIds = []) {
-  const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
-  const nextState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
-  const prunedState = pruneSessionGroups(nextState, openTabIds);
-  sessionGroupsState = prunedState;
-  await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: prunedState });
-  return prunedState;
+  // Capture this at request time: a later failed/successful refresh must not
+  // change whether this particular id list is safe to use for pruning.
+  const mayPrune = hasAuthoritativeOpenTabsSnapshot;
+  const snapshotTabIds = Array.isArray(openTabIds) ? openTabIds.slice() : [];
+
+  return enqueueSessionGroupsMutation(async () => {
+    const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
+    const nextState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
+    const resolvedState = mayPrune
+      ? pruneSessionGroups(nextState, snapshotTabIds)
+      : nextState;
+    sessionGroupsState = resolvedState;
+
+    // A load with an untrusted snapshot is read-only. This preserves manual
+    // groups across transient query failures during a sleep/discard action.
+    if (mayPrune) {
+      await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: resolvedState });
+    }
+    return resolvedState;
+  });
 }
 
 async function saveSessionGroups(nextState) {
-  sessionGroupsState = normalizeSessionGroups(nextState);
-  await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: sessionGroupsState });
-  return sessionGroupsState;
+  const normalizedState = normalizeSessionGroups(nextState);
+  return enqueueSessionGroupsMutation(async () => {
+    sessionGroupsState = normalizedState;
+    await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: sessionGroupsState });
+    return sessionGroupsState;
+  });
 }
 
 async function loadImportedChromeGroupMeta() {
@@ -851,14 +1242,15 @@ function disableChromeTabGroupsImportModeForLocalEdits() {
 }
 
 function shouldImportChromeGroupsIntoSessionState() {
-  if (!chromeTabGroupsEnabled) return false;
-  const groupCount = Array.isArray(sessionGroupsState?.groups) ? sessionGroupsState.groups.length : 0;
-  const assignmentCount = sessionGroupsState?.assignments ? Object.keys(sessionGroupsState.assignments).length : 0;
-  return groupCount === 0 && assignmentCount === 0;
+  // Retired: native Chrome groups are recognized live as first-class cards
+  // (queryUserChromeGroups) instead of being imported into session state,
+  // which would mark them managed and hide the cards. Keeping the function
+  // lets the toggle/refresh wiring short-circuit cleanly.
+  return false;
 }
 
 function ensureChromeTabGroupsSubscription() {
-  if (!chromeTabGroupsEnabled || typeof subscribeToChromeTabGroupChanges !== 'function') {
+  if (typeof subscribeToChromeTabGroupChanges !== 'function') {
     if (chromeTabGroupsImportTimer) {
       clearTimeout(chromeTabGroupsImportTimer);
       chromeTabGroupsImportTimer = null;
@@ -871,9 +1263,58 @@ function ensureChromeTabGroupsSubscription() {
   }
 
   if (chromeTabGroupsUnsubscribe) return;
-  chromeTabGroupsUnsubscribe = subscribeToChromeTabGroupChanges(() => {
-    if (isChromeTabGroupsImportSuppressed()) return;
-    scheduleChromeTabGroupsImport();
+  chromeTabGroupsUnsubscribe = subscribeToChromeTabGroupChanges((event = {}) => {
+    // C14: a tab dragged into a native group OUTSIDE the dashboard (browser
+    // strip drag, another window's new-tab page, context menu) leaves a stale
+    // manual-group assignment behind. When the event carries a tab that now
+    // belongs to a native group, drop it from the manual session groups so the
+    // next render cannot show it in two cards.
+    const eventTab = event?.tab;
+    const eventGroupId = eventTab?.groupId ?? event?.changeInfo?.groupId ?? event?.attachInfo?.groupId ?? -1;
+    // tabs.onAttached carries tabId + attachInfo (no tab object and no
+    // groupId): resolve the raw id against the live tab once so cross-window
+    // attach-to-group is cleaned too. Guard the lookup for that event source
+    // explicitly — attachInfo has no groupId, so a groupId-only guard makes
+    // the whole path unreachable.
+    const rawTabId = eventTab?.id != null ? Number(eventTab.id) : (event?.tabId != null ? Number(event.tabId) : null);
+    const isAttachEvent = event?.source === 'tabs.onAttached';
+    const resolveCleanup = async (tabId) => {
+      if (tabId == null) return;
+      let liveGroupId = Number(eventGroupId);
+      if (eventTab?.id == null) {
+        try {
+          const live = await chrome.tabs.get(tabId);
+          liveGroupId = live?.groupId != null ? Number(live.groupId) : -1;
+        } catch { liveGroupId = -1; }
+      }
+      if (Number(liveGroupId) < 0) return;
+      const currentAssignment = sessionGroupsState?.assignments?.[String(tabId)];
+      if (!currentAssignment) return;
+      let nextState = clearTabsFromSessionGroups(sessionGroupsState, [tabId]);
+      nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+      // saveSessionGroups already normalizes and assigns sessionGroupsState;
+      // do NOT write the raw nextState back in a .then (it could clobber the
+      // normalized shape or a newer state under race).
+      void saveSessionGroups(nextState);
+    };
+    if (rawTabId != null && (Number(eventGroupId) >= 0 || isAttachEvent)) {
+      void resolveCleanup(rawTabId);
+    }
+
+    // Live card recognition is a pure read — never gate it on the push/import
+    // suppression windows (those exist to stop sync echo). Browser group
+    // changes re-render the cards even when the sync toggle is off.
+    if (Date.now() >= (window.__suppressAutoRefreshUntil || 0)) {
+      if (window.__chromeGroupCardRefreshTimer) clearTimeout(window.__chromeGroupCardRefreshTimer);
+      window.__chromeGroupCardRefreshTimer = setTimeout(() => {
+        window.__chromeGroupCardRefreshTimer = null;
+        void renderDashboard();
+      }, 200);
+    }
+    // Push/import side stays gated by the toggle and the echo windows.
+    if (chromeTabGroupsEnabled && !isChromeTabGroupsImportSuppressed()) {
+      scheduleChromeTabGroupsImport();
+    }
   });
 }
 
@@ -940,6 +1381,13 @@ function scheduleChromeTabGroupsImport() {
       return;
     }
 
+    // The import pipeline is retired; do not pay for fetch/load/storage work
+    // on every Chrome group event just to discover that (C17).
+    if (!shouldImportChromeGroupsIntoSessionState()) {
+      disableChromeTabGroupsImportModeForLocalEdits();
+      return;
+    }
+
     chromeTabGroupsImportInFlight = true;
     try {
       await fetchOpenTabs();
@@ -980,13 +1428,24 @@ async function applyChromeTabGroupsToggle(nextEnabled) {
   if (enable && shouldImportChromeGroupsIntoSessionState()) {
     importedCount = await importChromeNativeGroupsIntoSessionGroups();
   } else if (!enable && typeof reconcileChromeTabGroupImports === 'function') {
+    // The import pipeline is retired: importedChromeGroupMeta entries are
+    // historical records, and the session groups they point to are now
+    // ordinary manual groups the user may still be using. Turning the toggle
+    // off must not delete those groups — only clear the stale metadata.
     const cleared = reconcileChromeTabGroupImports({
       currentState: sessionGroupsState,
       importedMeta: importedChromeGroupMeta,
       nativeGroups: [],
     });
-    await saveSessionGroups(cleared.state);
     await saveImportedChromeGroupMeta(cleared.importedMeta);
+  }
+
+  // When the user turns the Chrome-group sync toggle off, also tear down the
+  // dashboard-managed mirror groups instead of leaving them hidden and
+  // unmanageable (C16). syncChromeTabGroups sees cachedEnabled=false and calls
+  // removeAllChromeGroups().
+  if (!enable) {
+    await syncChromeTabGroupsWithoutImportEcho();
   }
 
   ensureChromeTabGroupsSubscription();
@@ -1007,11 +1466,33 @@ async function applyChromeTabGroupsToggle(nextEnabled) {
 async function loadGroupOrder() {
   const stored = await chrome.storage.local.get(GROUP_ORDER_KEY);
   groupOrderState = normalizeGroupOrderState(stored[GROUP_ORDER_KEY]);
+  // Chrome-group card keys are session-local and must never live in the
+  // durable card order. Clean any residue written before the filter was
+  // centralized here (C23).
+  const chromeKey = /^__chrome_group__:/;
+  const cleanSessionOrder = (groupOrderState.sessionOrder || []).filter(key => !chromeKey.test(String(key)));
+  const cleanPinnedOrder = (groupOrderState.pinnedOrder || []).filter(key => !chromeKey.test(String(key)));
+  if (cleanSessionOrder.length !== (groupOrderState.sessionOrder || []).length ||
+      cleanPinnedOrder.length !== (groupOrderState.pinnedOrder || []).length) {
+    groupOrderState = normalizeGroupOrderState({
+      ...groupOrderState,
+      sessionOrder: cleanSessionOrder,
+      pinnedOrder: cleanPinnedOrder,
+    });
+    await chrome.storage.local.set({ [GROUP_ORDER_KEY]: groupOrderState });
+  }
   return groupOrderState;
 }
 
 async function saveGroupOrder(nextState) {
-  groupOrderState = normalizeGroupOrderState(nextState);
+  const chromeKey = /^__chrome_group__:/;
+  const cleanSessionOrder = (nextState?.sessionOrder || []).map(String).filter(key => key && !chromeKey.test(key));
+  const cleanPinnedOrder = (nextState?.pinnedOrder || []).map(String).filter(key => key && !chromeKey.test(key));
+  groupOrderState = normalizeGroupOrderState({
+    ...nextState,
+    sessionOrder: cleanSessionOrder,
+    pinnedOrder: cleanPinnedOrder,
+  });
   await chrome.storage.local.set({ [GROUP_ORDER_KEY]: groupOrderState });
   return groupOrderState;
 }
@@ -1073,6 +1554,9 @@ function animatePageChipItems(listEl, previousRects) {
 }
 
 function syncGroupOrderState(orderKeys) {
+  // A reorder applies to the whole strip: both the session and pinned orders
+  // follow the new key order, and pinning is disabled so a pinned subset
+  // cannot retain a stale order after the reorder.
   groupOrderState = normalizeGroupOrderState({
     ...groupOrderState,
     sessionOrder: orderKeys,
@@ -1120,6 +1604,241 @@ function getTabsByIds(tabIds = [], tabs = openTabs) {
   return (Array.isArray(tabs) ? tabs : []).filter(tab => selectedIds.has(String(tab?.id)));
 }
 
+function getPageChipTabIdMap() {
+  const map = new Map();
+  document.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
+    const chipId = String(row.dataset.chipSortId || '');
+    const tabId = Number(row.dataset.tabId);
+    if (chipId && Number.isFinite(tabId)) map.set(chipId, tabId);
+  });
+  return map;
+}
+
+function getSelectedBatchTabIds() {
+  const collected = collectMovingTabIds([...selectedPageChipIds], '');
+  return [...new Set(collected.tabIds.map(Number).filter(Number.isFinite))];
+}
+
+async function refreshTabData() {
+  await fetchOpenTabs();
+  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+}
+
+async function runWithSuppressedRefresh(task) {
+  window.__suppressAutoRefreshUntil = Date.now() + 2000;
+  try {
+    return await task();
+  } finally {
+    window.__suppressAutoRefreshUntil = 0;
+  }
+}
+
+function beginBatchAction() {
+  window.__suppressAutoRefreshUntil = Date.now() + 2000;
+}
+
+async function finishBatchAction({ clearSelection = false, keptChipIds = null } = {}) {
+  if (clearSelection) {
+    selectedPageChipIds.clear();
+    pageChipSelectionAnchorId = '';
+  } else if (keptChipIds) {
+    selectedPageChipIds = new Set(keptChipIds);
+    pageChipSelectionAnchorId = '';
+  }
+  // Sync the selection UI immediately (batch bar/highlight), then render.
+  // The finally guarantees the refresh-suppression window is always closed,
+  // even when renderDashboard rejects.
+  refreshPageChipSelectionClasses();
+  try {
+    await renderDashboard();
+    updateBackToTopVisibility();
+  } finally {
+    window.__suppressAutoRefreshUntil = 0;
+  }
+}
+
+async function closeTabsSafely(tabIds, { playSound = true } = {}) {
+  let closedCount = 0;
+  const closedTabIds = new Set();
+  if (tabIds.length) {
+    const allTabs = await queryTabsForDashboardWindow();
+    const safeToClose = ensureWindowsKeepLastTab(allTabs, tabIds);
+    // Close in parallel so large batch operations do not degrade to N serial
+    // Chrome API round-trips; individual failures are still isolated.
+    const results = await Promise.allSettled(safeToClose.map(tabId => chrome.tabs.remove(tabId)));
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        closedCount += 1;
+        closedTabIds.add(Number(safeToClose[index]));
+      }
+      // Rejected tabs may already be gone; if they are still open, the
+      // re-render and selection-preservation paths keep them visible/selected.
+    });
+    if (closedCount > 0 && playSound) playCloseSound();
+  }
+  return { closedCount, closedTabIds };
+}
+
+async function closeTabsByUrlsSafely(urls, { exact = false, playSound = true } = {}) {
+  if (!urls || urls.length === 0) return { closedCount: 0, closedTabIds: new Set() };
+
+  const allTabs = await queryTabsForDashboardWindow();
+  let matched = [];
+
+  if (exact) {
+    const urlSet = new Set(urls.map(url => runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url));
+    matched = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
+  } else {
+    // Separate file:// URLs (exact match) from regular URLs (hostname match).
+    const targetHostnames = [];
+    const exactUrls = new Set();
+    for (const u of urls) {
+      const canonicalUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(u) : u;
+      if (canonicalUrl.startsWith('file://')) {
+        exactUrls.add(canonicalUrl);
+      } else {
+        try { targetHostnames.push(new URL(canonicalUrl).hostname); }
+        catch { /* skip unparseable */ }
+      }
+    }
+    matched = allTabs
+      .filter(tab => {
+        const tabUrl = getTabCanonicalUrl(tab);
+        if (tabUrl.startsWith('file://') && exactUrls.has(tabUrl)) return true;
+        try {
+          const tabHostname = new URL(tabUrl).hostname;
+          return tabHostname && targetHostnames.includes(tabHostname);
+        } catch { return false; }
+      })
+      .map(tab => tab.id);
+  }
+
+  return closeTabsSafely(matched, { playSound });
+}
+
+async function closeDuplicatesByUrls(urls, { keepOne = true, playSound = true } = {}) {
+  if (!urls || urls.length === 0) return { closedCount: 0, closedTabIds: new Set() };
+  const allTabs = await queryTabsForDashboardWindow();
+  const toClose = [];
+
+  for (const url of urls) {
+    const targetUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url;
+    const matching = allTabs.filter(t => getTabCanonicalUrl(t) === targetUrl);
+    if (keepOne) {
+      const keep = matching.find(t => t.active) || matching[0];
+      for (const tab of matching) {
+        if (tab.id !== keep.id) toClose.push(tab.id);
+      }
+    } else {
+      for (const tab of matching) toClose.push(tab.id);
+    }
+  }
+
+  return closeTabsSafely(toClose, { playSound });
+}
+
+async function closeDuplicatesInSelection(tabIds, { playSound = true } = {}) {
+  const selectedTabs = getTabsByIds(tabIds);
+  const byUrl = new Map();
+  for (const tab of selectedTabs) {
+    const url = getTabCanonicalUrl(tab);
+    if (!url) continue;
+    if (!byUrl.has(url)) byUrl.set(url, []);
+    byUrl.get(url).push(tab);
+  }
+  const toClose = [];
+  for (const tabs of byUrl.values()) {
+    if (tabs.length < 2) continue;
+    const keep = tabs.find(t => t.active) || tabs[0];
+    for (const tab of tabs) {
+      if (tab.id !== keep.id) toClose.push(tab.id);
+    }
+  }
+  return closeTabsSafely(toClose, { playSound });
+}
+
+// Saving a session persists first and then closes its source tabs. Preserve
+// that durable snapshot even if the best-effort close phase cannot obtain a
+// fresh tab snapshot, and expose only the ids Chrome actually closed.
+async function closeSavedSessionSourceTabs(tabIds = []) {
+  try {
+    const result = await closeTabsSafely(tabIds, { playSound: false });
+    return {
+      closedCount: result?.closedCount || 0,
+      closedTabIds: result?.closedTabIds || new Set(),
+      closeError: false,
+    };
+  } catch (error) {
+    console.warn('[tab-harbor] Saved-session source tabs could not be closed:', error);
+    return { closedCount: 0, closedTabIds: new Set(), closeError: true };
+  }
+}
+
+async function mergeTabsIntoChromeGroup(tabIds, { title, color }) {
+  // The write is muted so the dashboard's own group event cannot echo.
+  if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+  const { groupId, mergedTabIds } = await groupTabsWithStaleRetry(tabIds);
+  // `title` may be a function (mergedIds) => label: count-based labels must
+  // use the ACTUAL merged ids — stale ids dropped by groupTabsWithStaleRetry
+  // would otherwise inflate the count in the group title.
+  const label = typeof title === 'function' ? title(mergedTabIds) : title;
+  // The group is already created at this point. A rename/color failure must
+  // not be reported as "could not create the group" — the caller needs to
+  // know the side effect happened so it can still clean up (C5).
+  let updated = true;
+  try {
+    await chrome.tabGroups.update(groupId, { title: label, color });
+  } catch (err) {
+    updated = false;
+    console.warn('[tab-harbor] mergeTabsIntoChromeGroup: group created but update failed:', err);
+  }
+  return { groupId, updated, mergedTabIds };
+}
+
+async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
+  let discarded = 0;
+  let failed = 0;
+  let skippedActive = 0;
+  let stale = 0;
+  const resultsByTabId = new Map();
+
+  const tasks = (tabIds || []).map(async (rawTabId) => {
+    const tabId = Number(rawTabId);
+    if (!Number.isFinite(tabId)) return { tabId: null, status: 'stale' };
+
+    let liveTab = null;
+    try { liveTab = await chrome.tabs.get(tabId); } catch { liveTab = null; }
+    if (!liveTab) return { tabId, status: 'stale' };
+    if (skipActive && liveTab?.active) return { tabId, status: 'skipped-active' };
+    // Keep the exact manual membership briefly in case Chrome replaces this
+    // tab while the discard event is being delivered.
+    rememberSleepTabReplacementFallback(tabId);
+    const ok = await discardTab(tabId);
+    return { tabId, status: ok ? 'discarded' : 'failed' };
+  });
+
+  const settled = await Promise.all(tasks);
+  for (const result of settled) {
+    if (result.status === 'discarded') discarded += 1;
+    else if (result.status === 'failed') failed += 1;
+    else if (result.status === 'skipped-active') skippedActive += 1;
+    else if (result.status === 'stale') stale += 1;
+    if (result.tabId != null) resultsByTabId.set(result.tabId, { status: result.status });
+  }
+
+  return { discarded, failed, skippedActive, stale, resultsByTabId };
+}
+
+async function openSessionPickerForTabs(tabIds, source) {
+  const normalizedTabIds = (tabIds || []).map(String).filter(Boolean);
+  if (!normalizedTabIds.length) return;
+  await openTabSessionPicker({
+    source,
+    initialTabIds: normalizedTabIds,
+    scopeTabIds: normalizedTabIds,
+  });
+}
+
 function getTabGroupLookup(groups = domainGroups) {
   const lookup = new Map();
   for (const group of Array.isArray(groups) ? groups : []) {
@@ -1127,6 +1846,7 @@ function getTabGroupLookup(groups = domainGroups) {
       key: String(group?.domain || ''),
       label: getGroupDisplayLabel(group),
       manualGroupId: String(group?.manualGroupId || ''),
+      chromeGroupColor: String(group?.chromeGroupColor || ''),
     };
     for (const tab of Array.isArray(group?.tabs) ? group.tabs : []) {
       if (tab?.id != null) lookup.set(String(tab.id), groupEntry);
@@ -1167,16 +1887,16 @@ async function saveTabsAsSession(tabs, selectedTabIds, source = 'manual', name =
     .map(tab => getTabIdValue(tab?.id))
     .filter(Number.isFinite);
 
-  if (tabIdsToClose.length > 0) {
-    await chrome.tabs.remove(tabIdsToClose);
-  }
+  const closeResult = await closeSavedSessionSourceTabs(tabIdsToClose);
 
   await renderDashboard();
 
   return {
     session: snapshot,
     sessions: savedSessions,
-    closedTabIds: tabIdsToClose,
+    closedCount: closeResult.closedCount,
+    closedTabIds: [...closeResult.closedTabIds],
+    closeError: closeResult.closeError,
   };
 }
 
@@ -1223,14 +1943,14 @@ async function appendTabsToExistingSavedSession(sessionId, tabIds = []) {
     .map(tab => getTabIdValue(tab?.id))
     .filter(Number.isFinite);
 
-  if (tabIdsToClose.length > 0) {
-    await chrome.tabs.remove(tabIdsToClose);
-  }
+  const closeResult = await closeSavedSessionSourceTabs(tabIdsToClose);
 
   return {
     ...result,
     selectedCount: snapshot.tabs.length,
-    closedTabIds: tabIdsToClose,
+    closedCount: closeResult.closedCount,
+    closedTabIds: [...closeResult.closedTabIds],
+    closeError: closeResult.closeError,
   };
 }
 
@@ -1496,9 +2216,10 @@ async function submitTabSessionPicker() {
       };
       await renderDashboard();
       const skipped = result?.skippedDuplicateCount || 0;
+      const closedCount = result?.closedCount || 0;
       showToast(runtimeT
-        ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, skipped })
-        : `Added ${result?.appendedCount || 0} tabs${skipped ? `, skipped ${skipped} duplicates` : ''}`);
+        ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, closedCount, skipped })
+        : `Added ${result?.appendedCount || 0} tabs; closed ${closedCount} originals${skipped ? `, skipped ${skipped} duplicates` : ''}`);
       return;
     }
 
@@ -1514,8 +2235,11 @@ async function submitTabSessionPicker() {
       newSessionName
     );
     showToast(runtimeT
-      ? runtimeT('toastSessionSaved', { count: result?.session?.tabs?.length || 0 })
-      : 'Session saved');
+      ? runtimeT('toastSessionSaved', {
+        count: result?.session?.tabs?.length || 0,
+        closedCount: result?.closedCount || 0,
+      })
+      : `Saved ${result?.session?.tabs?.length || 0} tabs; closed ${result?.closedCount || 0} originals`);
   } catch (err) {
     console.error('[tab-harbor] Failed to save selected tabs:', err);
     showToast(runtimeT ? runtimeT('toastSessionActionFailed') : 'Could not update saved tabs');
@@ -1523,8 +2247,10 @@ async function submitTabSessionPicker() {
 }
 
 async function openSavedTabsInCurrentWindow(tabs = []) {
-  const [firstTab, ...restTabs] = Array.isArray(tabs) ? tabs : [];
-  if (!firstTab?.url) return { restoredTabs: [], windowId: null };
+  const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
+  const [firstEntry, ...restEntries] = entries;
+  const firstTab = firstEntry?.tab;
+  if (!firstTab?.url) return { restoredTabs: [], windowId: null, backgroundTabDiscards: [] };
 
   const currentWindowId = await getCurrentWindowId();
   const firstCreatedTab = currentWindowId != null
@@ -1539,27 +2265,40 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
   const targetWindowId = firstCreatedTab?.windowId ?? currentWindowId ?? null;
   const restoredTabs = firstCreatedTab?.id != null
-    ? [{ id: firstCreatedTab.id, url: firstTab.url }]
+    ? [{ id: firstCreatedTab.id, url: firstTab.url, sourceIndex: firstEntry.sourceIndex, groupKey: firstTab.groupKey }]
+    : [];
+  // Queue the active first tab too. Chrome will reject it while it is active,
+  // but once the user switches away the shared retry path can sleep it just
+  // like every other restored tab.
+  const backgroundTabDiscards = firstCreatedTab?.id != null
+    ? [{ tabId: firstCreatedTab.id, url: firstTab.url }]
     : [];
 
-  for (const tab of restTabs) {
+  for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
       windowId: targetWindowId,
       url: tab.url,
       active: false,
     });
+    if (createdTab?.id != null) {
+      backgroundTabDiscards.push({ tabId: createdTab.id, url: tab.url });
+    }
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      sourceIndex,
+      groupKey: tab.groupKey,
     });
   }
 
-  return { restoredTabs, windowId: targetWindowId };
+  return { restoredTabs, windowId: targetWindowId, backgroundTabDiscards };
 }
 
 async function openSavedTabsInNewWindow(tabs = []) {
-  const [firstTab, ...restTabs] = Array.isArray(tabs) ? tabs : [];
-  if (!firstTab?.url) return { restoredTabs: [], windowId: null };
+  const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
+  const [firstEntry, ...restEntries] = entries;
+  const firstTab = firstEntry?.tab;
+  if (!firstTab?.url) return { restoredTabs: [], windowId: null, backgroundTabDiscards: [] };
 
   const createdWindow = await chrome.windows.create({
     url: firstTab.url,
@@ -1571,6 +2310,8 @@ async function openSavedTabsInNewWindow(tabs = []) {
     restoredTabs.push({
       id: firstCreatedTab.id,
       url: firstTab.url,
+      sourceIndex: firstEntry.sourceIndex,
+      groupKey: firstTab.groupKey,
     });
   } else if (createdWindow?.id != null) {
     const createdWindowTabs = await chrome.tabs.query({ windowId: createdWindow.id });
@@ -1579,33 +2320,57 @@ async function openSavedTabsInNewWindow(tabs = []) {
       restoredTabs.push({
         id: queriedFirstTab.id,
         url: firstTab.url,
+        sourceIndex: firstEntry.sourceIndex,
+        groupKey: firstTab.groupKey,
       });
     }
   }
+  // The first tab is active in the newly focused window, so it cannot be
+  // discarded yet. Keep it in the same queue and sleep it after focus moves.
+  const backgroundTabDiscards = firstCreatedTab?.id != null
+    ? [{ tabId: firstCreatedTab.id, url: firstTab.url }]
+    : [];
 
-  for (const tab of restTabs) {
+  for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
       windowId: createdWindow.id,
       url: tab.url,
       active: false,
     });
+    if (createdTab?.id != null) {
+      backgroundTabDiscards.push({ tabId: createdTab.id, url: tab.url });
+    }
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      sourceIndex,
+      groupKey: tab.groupKey,
     });
   }
 
-  return { restoredTabs, windowId: createdWindow?.id ?? null };
+  return { restoredTabs, windowId: createdWindow?.id ?? null, backgroundTabDiscards };
+}
+
+function scheduleRestoredSessionBackgroundDiscards(backgroundTabDiscards = []) {
+  for (const item of Array.isArray(backgroundTabDiscards) ? backgroundTabDiscards : []) {
+    if (item?.tabId != null) {
+      discardRestoredTabAfterCommit(item.tabId, item.url);
+    }
+  }
 }
 
 async function restoreSavedTabToBrowser(tabUrl) {
   if (!tabUrl) return null;
   const restoreMode = runtimeGetSavedSessionRestoreMode ? runtimeGetSavedSessionRestoreMode() : 'new-window';
   if (restoreMode === 'current-window') {
-    const { windowId } = await openSavedTabsInCurrentWindow([{ url: tabUrl }]);
+    const opened = await openSavedTabsInCurrentWindow([{ url: tabUrl }]);
+    scheduleRestoredSessionBackgroundDiscards(opened.backgroundTabDiscards);
+    const { windowId } = opened;
     return { windowId, restoreMode };
   }
-  const { windowId } = await openSavedTabsInNewWindow([{ url: tabUrl }]);
+  const opened = await openSavedTabsInNewWindow([{ url: tabUrl }]);
+  scheduleRestoredSessionBackgroundDiscards(opened.backgroundTabDiscards);
+  const { windowId } = opened;
   return { windowId, restoreMode };
 }
 
@@ -1621,30 +2386,168 @@ async function restoreSavedTabSession(sessionId) {
   }
 
   const restoreMode = runtimeGetSavedSessionRestoreMode ? runtimeGetSavedSessionRestoreMode() : 'new-window';
-  const { restoredTabs, windowId } = restoreMode === 'current-window'
-    ? await openSavedTabsInCurrentWindow(session.tabs)
-    : await openSavedTabsInNewWindow(session.tabs);
 
-  const nextSessionGroups = runtimeCreateRestoredSessionGroups({
-    existingState: sessionGroupsState,
-    session,
-    restoredTabs,
-    now: new Date().toISOString(),
+  // Run under the refresh-suppression window: the burst of tabs.create and the
+  // deferred discard events echo back as tabs-changed → debounced renderDashboard
+  // calls. The restore already renders explicitly below, so suppressing that
+  // echo avoids a redundant post-restore refresh. The explicit renderDashboard
+  // call is unaffected — suppression only gates the event-driven refresh path.
+  return runWithSuppressedRefresh(async () => {
+    const { restoredTabs, windowId, backgroundTabDiscards } = restoreMode === 'current-window'
+      ? await openSavedTabsInCurrentWindow(session.tabs)
+      : await openSavedTabsInNewWindow(session.tabs);
+
+    const { state: nextSessionGroups, chromeGroupPlans } = runtimeCreateRestoredSessionGroups({
+      existingState: sessionGroupsState,
+      session,
+      restoredTabs,
+      now: new Date().toISOString(),
+    });
+    let chromeGroupRestore = { attempted: 0, restored: [], failures: [] };
+    try {
+      // Re-create native Chrome groups that were saved with the session:
+      // fresh groups with the recorded title/color, tabs in the recorded
+      // order. The result records a partial native-group restore instead of
+      // hiding a group that was created successfully but could not be
+      // named/colored.
+      chromeGroupRestore = await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
+    } finally {
+      // Restored background tabs transition to asleep only after native Chrome
+      // grouping/metadata/order has finished. That keeps Chrome's group APIs
+      // operating on live, just-created tabs instead of racing tab discard.
+      scheduleRestoredSessionBackgroundDiscards(backgroundTabDiscards);
+    }
+
+    await saveSessionGroups(nextSessionGroups);
+    await renderDashboard();
+
+    return {
+      restoredCount: restoredTabs.length,
+      windowId,
+      chromeGroupRestore,
+    };
   });
-  await saveSessionGroups(nextSessionGroups);
-  await renderDashboard();
+}
 
-  return {
-    restoredCount: restoredTabs.length,
-    windowId,
-  };
+/**
+ * restoreChromeGroupsForSession(plans, windowId)
+ *
+ * Executes saved-session Chrome-group plans: creates a fresh native Chrome
+ * group per plan (the recorded group id is session-local and cannot be
+ * reused), restores its title/color and orders the tabs as recorded. A
+ * same-title group already in the window gets a " (2)"/" (3)" suffix so the
+ * restored group stays independent instead of merging. Writes are muted so
+ * the dashboard's own group events cannot echo.
+ */
+async function restoreChromeGroupsForSession(plans, windowId) {
+  const result = { attempted: 0, restored: [], failures: [] };
+  if (!Array.isArray(plans) || !plans.length) return result;
+  let existingTitles = new Set();
+  try {
+    // Same-title conflict check is scoped to the restore target window; let
+    // the API filter instead of pulling every window's groups.
+    const groups = windowId != null
+      ? await chrome.tabGroups.query({ windowId: Number(windowId) })
+      : await chrome.tabGroups.query({});
+    existingTitles = new Set(groups
+      .map(g => String(g.title || ''))
+      .filter(Boolean));
+  } catch { /* keep the empty set: creation still proceeds */ }
+
+  for (const plan of plans) {
+    const planTabIds = (Array.isArray(plan?.tabIds) ? plan.tabIds : [])
+      .map(Number)
+      .filter(Number.isFinite);
+    if (!planTabIds.length) continue;
+    result.attempted += 1;
+
+    let title = String(plan?.title || '').trim();
+    // Same-title group already in the window → independent group with a
+    // " (N)" suffix instead of merging into the existing one.
+    if (title && existingTitles.has(title)) {
+      let suffix = 2;
+      let candidate = `${title} (${suffix})`;
+      while (existingTitles.has(candidate)) {
+        suffix += 1;
+        candidate = `${title} (${suffix})`;
+      }
+      title = candidate;
+    }
+    if (title) existingTitles.add(title);
+
+    let groupId = null;
+    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+    try {
+      // Chrome creates the new group in the CALLER's window by default, which
+      // would drag tabs created in the restore target window across windows
+      // (observed: new-window restore split the session across two windows,
+      // chrome-group tabs flashing into the dashboard window). Pinning the new
+      // group to the target window via createProperties.windowId keeps every
+      // restored tab in place — the group appears directly in the target
+      // window with no tab relocation.
+      const groupOptions = windowId != null
+        ? { tabIds: planTabIds, createProperties: { windowId: Number(windowId) } }
+        : { tabIds: planTabIds };
+      groupId = await chrome.tabs.group(groupOptions);
+      if (groupId == null) {
+        result.failures.push({ stage: 'create', title, tabIds: planTabIds });
+        console.warn('[tab-harbor] restoreChromeGroupsForSession: Chrome returned no group id');
+        continue;
+      }
+    } catch (err) {
+      result.failures.push({ stage: 'create', title, tabIds: planTabIds });
+      console.warn('[tab-harbor] restoreChromeGroupsForSession: group creation failed:', err);
+      continue;
+    }
+
+    const restored = {
+      groupId: Number(groupId),
+      title,
+      tabIds: planTabIds,
+      metadataApplied: false,
+      orderApplied: false,
+    };
+    result.restored.push(restored);
+    try {
+      await chrome.tabGroups.update(groupId, {
+        title,
+        color: String(plan?.color || 'grey'),
+      });
+      restored.metadataApplied = true;
+    } catch (err) {
+      // The native group and its membership now exist, so report that exact
+      // half-success to the caller rather than swallowing it as a generic
+      // console warning.
+      result.failures.push({ stage: 'metadata', groupId: Number(groupId), title, tabIds: planTabIds });
+      console.warn('[tab-harbor] restoreChromeGroupsForSession: group metadata update failed:', err);
+    }
+
+    // The tabs were created in recorded order; reorder the native group to
+    // match the saved in-group order exactly. Ordering is independent of the
+    // cosmetic metadata write, so still attempt it after a metadata failure.
+    if (typeof reorderGroupedTabs === 'function') {
+      try {
+        await reorderGroupedTabs(groupId, planTabIds.map(String), windowId);
+        restored.orderApplied = true;
+      } catch (err) {
+        result.failures.push({ stage: 'order', groupId: Number(groupId), title, tabIds: planTabIds });
+        console.warn('[tab-harbor] restoreChromeGroupsForSession: group ordering failed:', err);
+      }
+    } else {
+      restored.orderApplied = true;
+    }
+  }
+  return result;
 }
 
 async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
   const numericTabId = getTabIdValue(tabId);
   if (numericTabId != null) {
-    await chrome.tabs.remove(numericTabId);
-    return numericTabId;
+    try {
+      await chrome.tabs.remove(numericTabId);
+      return numericTabId;
+    } catch { /* tab already gone — treat as removed */ }
+    return null;
   }
 
   const allTabs = await queryTabsForDashboardWindow();
@@ -1654,8 +2557,10 @@ async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
     return tab.url === tabUrl || canonicalUrl === targetUrl;
   });
   if (match?.id != null) {
-    await chrome.tabs.remove(match.id);
-    return match.id;
+    try {
+      await chrome.tabs.remove(match.id);
+      return match.id;
+    } catch { /* tab already gone — treat as removed */ }
   }
   return null;
 }
@@ -1765,10 +2670,16 @@ function buildPersistentGroupOrderReplacingKey(replacementGroupKey, replacedGrou
   const normalizedReplacedKey = String(replacedGroupKey || '');
   if (!normalizedReplacementKey) return [];
 
+  const isChromeGroupKey = key => String(key || '').startsWith('__chrome_group__:');
   const currentKeys = domainGroups
     .map(group => String(group?.domain || ''))
     .filter(Boolean)
-    .filter(key => key !== normalizedReplacementKey);
+    .filter(key => key !== normalizedReplacementKey)
+    .filter(key => !isChromeGroupKey(key));
+
+  // Chrome-group cards are ordered by the browser tab strip, not by the
+  // dashboard's persisted group order, so they must never enter that order.
+  if (isChromeGroupKey(normalizedReplacementKey)) return currentKeys;
 
   if (!normalizedReplacedKey) {
     currentKeys.push(normalizedReplacementKey);
@@ -1786,7 +2697,8 @@ function buildPersistentGroupOrderReplacingKey(replacementGroupKey, replacedGrou
 }
 
 async function persistGroupOrder(orderKeys = []) {
-  const normalizedKeys = [...new Set((orderKeys || []).map(key => String(key)).filter(Boolean))];
+  const normalizedKeys = [...new Set((orderKeys || []).map(key => String(key)).filter(Boolean))]
+    .filter(key => !key.startsWith('__chrome_group__:'));
   if (!normalizedKeys.length) return groupOrderState;
 
   return saveGroupOrder({
@@ -1922,7 +2834,60 @@ function clampPageChipClientPoint(clientX, clientY) {
   };
 }
 
+function stopPageChipAutoScroll() {
+  if (pageChipAutoScrollRaf) {
+    cancelAnimationFrame(pageChipAutoScrollRaf);
+    pageChipAutoScrollRaf = 0;
+  }
+}
+
+function updatePageChipAutoScroll(clientX, clientY) {
+  if (!pageChipDragState || !draggedPageChipId) return;
+  pageChipDragState.lastClientX = clientX;
+  pageChipDragState.lastClientY = clientY;
+
+  const viewportHeight = window.innerHeight;
+  const maxScroll = Math.max(0, document.documentElement.scrollHeight - viewportHeight);
+  if (maxScroll <= 0) {
+    stopPageChipAutoScroll();
+    return;
+  }
+
+  const bottomZone = viewportHeight - PAGE_CHIP_EDGE_SCROLL_ZONE;
+  let delta = 0;
+  if (clientY < PAGE_CHIP_EDGE_SCROLL_ZONE) {
+    const intensity = 1 - Math.max(0, clientY) / PAGE_CHIP_EDGE_SCROLL_ZONE;
+    delta = -Math.max(2, Math.round(PAGE_CHIP_EDGE_SCROLL_SPEED * intensity));
+    if (window.scrollY <= 0) delta = 0;
+  } else if (clientY > bottomZone) {
+    const intensity = Math.min(1, (clientY - bottomZone) / PAGE_CHIP_EDGE_SCROLL_ZONE);
+    delta = Math.max(2, Math.round(PAGE_CHIP_EDGE_SCROLL_SPEED * intensity));
+    if (window.scrollY >= maxScroll) delta = 0;
+  }
+
+  if (!delta) {
+    stopPageChipAutoScroll();
+    return;
+  }
+
+  if (pageChipAutoScrollRaf) return;
+
+  pageChipAutoScrollRaf = requestAnimationFrame(() => {
+    pageChipAutoScrollRaf = 0;
+    if (!pageChipDragState || !draggedPageChipId) return;
+    const x = pageChipDragState.lastClientX;
+    const y = pageChipDragState.lastClientY;
+    if (x == null || y == null) return;
+    window.scrollBy(0, delta);
+    // The page moved under a stationary pointer, so the drop target must be
+    // resolved again at the same viewport point.
+    previewPageChipOrder(x, y);
+    updatePageChipAutoScroll(x, y);
+  });
+}
+
 function clearPageChipDragState({ removeNode = false } = {}) {
+  stopPageChipAutoScroll();
   const handleEl = pageChipDragState?.handleEl || null;
   const pointerId = pageChipDragState?.pointerId;
   draggedPageChipId = '';
@@ -1948,6 +2913,7 @@ function clearPageChipDragState({ removeNode = false } = {}) {
 
   pageChipDragState = null;
   draggedPageChipEl = null;
+  document.getElementById('pageChipDragBadge')?.remove();
 }
 
 function updateDraggedPageChipPosition(clientX, clientY) {
@@ -1956,6 +2922,12 @@ function updateDraggedPageChipPosition(clientX, clientY) {
 
   draggedPageChipEl.style.setProperty('--drag-left', `${clampedPoint.clientX - pageChipDragState.offsetX}px`);
   draggedPageChipEl.style.setProperty('--drag-top', `${clampedPoint.clientY - pageChipDragState.offsetY}px`);
+
+  const badge = document.getElementById('pageChipDragBadge');
+  if (badge) {
+    badge.style.left = `${clampedPoint.clientX + 14}px`;
+    badge.style.top = `${clampedPoint.clientY - 22}px`;
+  }
 }
 
 function startPageChipDragVisuals() {
@@ -1966,10 +2938,24 @@ function startPageChipDragVisuals() {
   draggedPageChipEl.classList.add('is-dragging');
   draggedPageChipEl.style.setProperty('--drag-width', `${draggedPageChipEl.getBoundingClientRect().width}px`);
   ensurePageChipPlaceholder();
+  // Batch feedback: show how many rows are moving.
+  updatePageChipDragBadge(pageChipDragState.movingChipIds?.length || 1);
   logPageChipDragDebug('drag-start', {
     groupKey: pageChipDragState.sourceGroupKey,
     chip: draggedPageChipId,
   });
+}
+
+function updatePageChipDragBadge(count) {
+  let badge = document.getElementById('pageChipDragBadge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'pageChipDragBadge';
+    badge.className = 'page-chip-drag-badge';
+    document.body.appendChild(badge);
+  }
+  badge.textContent = count > 1 ? `×${count}` : '';
+  badge.style.display = count > 1 ? '' : 'none';
 }
 
 function syncPageChipDropTarget(clientX, clientY) {
@@ -2042,6 +3028,16 @@ function syncPageChipDropTarget(clientX, clientY) {
     listEl,
   };
   setPageChipDropPreview(cardEl);
+  // Keep the count badge honest per drop context: when dropping back on the
+  // source group only the rows present in this list actually reorder, while a
+  // cross-group drop moves the whole batch.
+  if (groupKey === pageChipDragState.sourceGroupKey) {
+    const movingIds = Array.isArray(pageChipDragState.movingChipIds) ? pageChipDragState.movingChipIds : [];
+    const inListCount = movingIds.filter(id => [...listEl.children].some(n => String(n.dataset?.chipSortId || '') === String(id))).length;
+    updatePageChipDragBadge(inListCount);
+  } else {
+    updatePageChipDragBadge(Array.isArray(pageChipDragState.movingChipIds) ? pageChipDragState.movingChipIds.length : 1);
+  }
   const signature = `group:${groupKey}`;
   if (pageChipDragState.debugTargetSignature !== signature) {
     pageChipDragState.debugTargetSignature = signature;
@@ -2063,7 +3059,10 @@ function previewPageChipOrder(clientX, clientY) {
 
   const placeholder = ensurePageChipPlaceholder(listEl);
   const previousRects = new Map();
-  const items = [...listEl.querySelectorAll('[data-chip-sort-id]:not(.is-dragging)')];
+  // Collapsed overflow rows are hidden (zero-size) and sit after every visible
+  // row; they must not be insertion candidates, or a drop at the bottom of the
+  // visible list would land the batch inside the collapsed section.
+  const items = [...listEl.querySelectorAll('[data-chip-sort-id]:not(.is-dragging):not(.page-chip--collapsed)')];
 
   items.forEach(item => {
     previousRects.set(item.dataset.chipSortId || '', item.getBoundingClientRect());
@@ -2081,7 +3080,11 @@ function previewPageChipOrder(clientX, clientY) {
   if (insertBeforeItem) {
     listEl.insertBefore(placeholder, insertBeforeItem);
   } else {
-    listEl.appendChild(placeholder);
+    // Dropping below the last visible row: park the placeholder right before
+    // the collapsed block (i.e. as the last visible row), not at the end.
+    const firstCollapsed = listEl.querySelector('.page-chip--collapsed');
+    if (firstCollapsed) listEl.insertBefore(placeholder, firstCollapsed);
+    else listEl.appendChild(placeholder);
   }
 
   animatePageChipItems(listEl, previousRects);
@@ -2089,6 +3092,9 @@ function previewPageChipOrder(clientX, clientY) {
 
 async function saveGroupTabRowOrder(groupKey, orderIds) {
   if (!groupKey || !Array.isArray(orderIds) || !orderIds.length) return;
+  // Chrome-group card rows are session-local and follow the native strip
+  // order; never persist their keys into the durable per-group tab order.
+  if (String(groupKey || '').startsWith('__chrome_group__:')) return;
 
   await saveGroupTabOrder({
     ...groupTabOrderState,
@@ -2101,64 +3107,199 @@ function createSessionGroupFromDraggedTab(state, tab) {
   return addSessionGroup(state, nextName);
 }
 
-async function saveCrossGroupTabRowOrder(sourceGroupKey, targetGroupKey, targetListEl, draggedId) {
-  const nextState = {
-    ...groupTabOrderState,
-    [String(sourceGroupKey)]: getOrderedIdsForGroup(sourceGroupKey).filter(id => id !== String(draggedId || '')),
-    [String(targetGroupKey)]: targetListEl
-      ? buildOrderedIdsFromList(targetListEl, draggedId)
-      : [String(draggedId || '')].filter(Boolean),
-  };
+async function saveCrossGroupTabRowOrder(sourceGroupKey, targetGroupKey, targetListEl, movingIds) {
+  const ids = Array.isArray(movingIds)
+    ? movingIds.map(id => String(id)).filter(Boolean)
+    : [String(movingIds || '')].filter(Boolean);
+  if (!ids.length) return;
+
+  // Remove every moving chip from its own source group's stored order, so a
+  // selection spanning several cards cleans up every card it left.
+  const chipsByGroup = {};
+  for (const id of ids) {
+    const groupKey = findGroupKeyForChip(id) || String(sourceGroupKey || '');
+    if (!groupKey) continue;
+    chipsByGroup[groupKey] = chipsByGroup[groupKey] || [];
+    chipsByGroup[groupKey].push(id);
+  }
+  const nextState = { ...groupTabOrderState };
+  for (const [groupKey, chipIds] of Object.entries(chipsByGroup)) {
+    const chipSet = new Set(chipIds);
+    nextState[groupKey] = getOrderedIdsForGroup(groupKey).filter(id => !chipSet.has(String(id || '')));
+  }
+  nextState[String(targetGroupKey)] = targetListEl
+    ? buildCrossGroupTargetOrder(targetListEl, ids)
+    : ids;
 
   await saveGroupTabOrder(nextState);
 }
 
-async function moveDraggedPageChipToGroup(targetGroupKey) {
+function buildCrossGroupTargetOrder(targetListEl, movingIds) {
+  const children = [...targetListEl.children];
+  const movingSet = new Set((movingIds || []).map(String).filter(Boolean));
+  // Chips already in the target card are part of the batch: remove them from
+  // the pre-existing order so the whole batch lands contiguously at the drop
+  // point without duplicates (the batch order wins over the old position).
+  const targetIds = children
+    .filter(n => n.dataset?.chipSortId)
+    .map(n => String(n.dataset.chipSortId))
+    .filter(id => !movingSet.has(id));
+  const placeholderIdx = children.findIndex(n => n === pageChipPlaceholderEl);
+  const insertAt = placeholderIdx === -1
+    ? targetIds.length
+    : Math.min(
+        children.slice(0, placeholderIdx)
+          .filter(n => n.dataset?.chipSortId && !movingSet.has(String(n.dataset.chipSortId)))
+          .length,
+        targetIds.length
+      );
+  targetIds.splice(insertAt, 0, ...(movingIds || []).map(String).filter(Boolean));
+  return targetIds;
+}
+
+async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
   const sourceGroupKey = pageChipDragState?.sourceGroupKey || '';
   const draggedChipId = draggedPageChipId;
-  const draggedTabIds = getTabIdsForGroupChip(sourceGroupKey, draggedChipId);
+  // Move the whole selection together when the dragged row is selected,
+  // resolving each chip's own source card (cross-card selections work).
+  const movingChipIds = getMovingPageChipIds();
+  const collected = collectMovingTabIds(movingChipIds, sourceGroupKey);
+  const draggedTabIds = collected.tabIds;
+  const sourceGroupKeys = Object.keys(collected.groupsById);
   if (!sourceGroupKey || !draggedChipId || !draggedTabIds.length) return null;
   const targetWasManualGroup = isManualGroupKey(targetGroupKey);
+  const targetGroup = getDomainGroupByKey(targetGroupKey);
 
   logPageChipDragDebug('move-group-begin', {
     sourceGroupKey,
     targetGroupKey,
     draggedChipId,
+    movingChips: movingChipIds.join(','),
     tabIds: draggedTabIds.join(','),
   });
+
+  // Dropping into a user-created Chrome group card joins that native group —
+  // the tabs leave their previous dashboard/Chrome membership behind.
+  if (targetGroup?.isChromeGroup && targetGroup.chromeGroupId != null) {
+    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+    // The native group write is the source of truth. If it fails (stale tab,
+    // pinned tab, deleted target group, API error), abort the move instead of
+    // silently clearing saved session assignments (C1).
+    try {
+      await groupTabsWithStaleRetryIntoGroup(Number(targetGroup.chromeGroupId), draggedTabIds);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-chrome-group: join failed:', err);
+      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not join Chrome tab group');
+      return null;
+    }
+    // Persist the FULL drop order into the native group too:
+    // chrome.tabs.group appends the batch at the group tail, which would
+    // diverge from the panel order when the drop lands mid-card. Build the
+    // whole target order (existing rows + batch at the placeholder) and
+    // reorder the native group to match it, so the strip follows the cards.
+    try {
+      const firstWindowId = draggedTabIds.length
+        ? (await chrome.tabs.get(draggedTabIds[0]).catch(() => null))?.windowId
+        : null;
+      if (firstWindowId != null && typeof reorderGroupedTabs === 'function') {
+        const fullTargetOrder = targetListEl
+          ? buildCrossGroupTargetOrder(targetListEl, movingChipIds)
+          : [];
+        const orderForNative = fullTargetOrder.length
+          ? fullTargetOrder
+          : draggedTabIds.map(String);
+        await reorderGroupedTabs(Number(targetGroup.chromeGroupId), orderForNative.map(String), Number(firstWindowId));
+      }
+    } catch (err) {
+      // The join already succeeded; a reorder failure must not roll back the
+      // move or clear the session state. Keep it observable in the console.
+      console.warn('[tab-harbor] move-to-chrome-group: reorder failed:', err);
+    }
+    let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
+    nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+    try {
+      await saveSessionGroups(nextState);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-chrome-group: session cleanup failed:', err);
+      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+    }
+    logPageChipDragDebug('move-group-join-chrome', {
+      groupId: targetGroup.chromeGroupId,
+      tabCount: draggedTabIds.length,
+    });
+    return {
+      groupKey: targetGroupKey,
+      groupName: targetGroup.label || 'Group',
+      targetWasManualGroup: false,
+      sourceGroupKeys,
+    };
+  }
+
+  // Leaving a user-created Chrome group card (dropping into a domain/manual
+  // card or a new group) detaches the batch from its native group first.
+  const sourceGroups = sourceGroupKeys
+    .map(key => getDomainGroupByKey(key))
+    .filter(Boolean);
+  if (sourceGroups.some(group => group?.isChromeGroup)) {
+    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+    try {
+      await ungroupTabsWithStaleRetry(draggedTabIds);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-group: ungroup failed:', err);
+      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not leave Chrome tab group');
+      return null;
+    }
+    logPageChipDragDebug('move-group-ungroup-chrome', {
+      tabCount: draggedTabIds.length,
+    });
+  }
+
   let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
-  const targetGroup = ensureManualDropGroup(nextState, targetGroupKey);
-  nextState = reassignTabsToSessionGroup(targetGroup.nextState, draggedTabIds, targetGroup.groupId);
+  const dropTarget = ensureManualDropGroup(nextState, targetGroupKey);
+  nextState = reassignTabsToSessionGroup(dropTarget.nextState, draggedTabIds, dropTarget.groupId);
   nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
   logPageChipDragDebug('move-group-save-session', {
-    groupId: targetGroup.groupId,
-    groupName: targetGroup.groupName,
+    groupId: dropTarget.groupId,
+    groupName: dropTarget.groupName,
   });
-  await saveSessionGroups(nextState);
+  try {
+    await saveSessionGroups(nextState);
+  } catch (err) {
+    console.warn('[tab-harbor] move-to-manual-group: session cleanup failed:', err);
+    showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+  }
   logPageChipDragDebug('move-group-end', {
-    groupId: targetGroup.groupId,
-    groupName: targetGroup.groupName,
+    groupId: dropTarget.groupId,
+    groupName: dropTarget.groupName,
   });
 
   return {
-    groupKey: `${MANUAL_GROUP_PREFIX}${targetGroup.groupId}`,
-    groupName: targetGroup.groupName,
+    groupKey: `${MANUAL_GROUP_PREFIX}${dropTarget.groupId}`,
+    groupName: dropTarget.groupName,
     targetWasManualGroup,
+    sourceGroupKeys,
   };
 }
 
 async function createSessionGroupFromDraggedPageChip() {
   const sourceGroupKey = pageChipDragState?.sourceGroupKey || '';
   const draggedChipId = draggedPageChipId;
-  const draggedTabs = getDomainGroupByKey(sourceGroupKey)?.tabs?.filter(tab =>
-    getTabOrderTokens(tab).includes(String(draggedChipId || ''))
-  ) || [];
-  const draggedTabIds = draggedTabs.map(tab => Number(tab?.id)).filter(Number.isFinite);
+  // Create the group from the whole selection when the dragged row is
+  // selected, resolving each chip's own source card.
+  const movingChipIds = getMovingPageChipIds();
+  const collected = collectMovingTabIds(movingChipIds, sourceGroupKey);
+  const draggedTabIds = collected.tabIds;
+  const sourceGroupKeys = Object.keys(collected.groupsById);
+  const movingSet = new Set(movingChipIds);
+  const draggedTabs = (domainGroups || [])
+    .flatMap(group => group.tabs || [])
+    .filter(tab => getTabOrderTokens(tab).some(token => movingSet.has(String(token))));
   if (!sourceGroupKey || !draggedChipId || !draggedTabs.length || !draggedTabIds.length) return null;
 
   logPageChipDragDebug('create-group-begin', {
     sourceGroupKey,
     draggedChipId,
+    movingChips: movingChipIds.join(','),
     tabIds: draggedTabIds.join(','),
   });
   let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
@@ -2174,17 +3315,26 @@ async function createSessionGroupFromDraggedPageChip() {
     groupId: created.group.id,
     groupName: created.group.name,
   });
-  await saveCrossGroupTabRowOrder(sourceGroupKey, `${MANUAL_GROUP_PREFIX}${created.group.id}`, null, draggedChipId);
+  await saveCrossGroupTabRowOrder(sourceGroupKey, `${MANUAL_GROUP_PREFIX}${created.group.id}`, null, getMovingPageChipIds());
   logPageChipDragDebug('create-group-end', {
     groupId: created.group.id,
     groupName: created.group.name,
+    sourceGroups: sourceGroupKeys.join(','),
   });
 
-  return created.group;
+  return { ...created.group, sourceGroupKeys };
 }
 
 async function finishPageChipDrag() {
   if (!draggedPageChipId || !pageChipDragState) return false;
+
+  // Stop edge auto-scroll before the async commit so a scheduled frame cannot
+  // change the drop target mid-commit.
+  stopPageChipAutoScroll();
+
+  // While a commit is in flight, Escape must not clear pageChipDragState —
+  // the commit reads that state after await points (C9).
+  pageChipCommitInFlight = true;
 
   const moved = pageChipDragState.moved;
   const sourceGroupKey = pageChipDragState.sourceGroupKey;
@@ -2204,32 +3354,77 @@ async function finishPageChipDrag() {
     let requiresOpenTabsRebuild = true;
     if (moved) {
       if (targetGroupKey && targetGroupKey === sourceGroupKey && targetListEl) {
-        const orderIds = buildOrderedIdsFromList(targetListEl, draggedPageChipId);
-        logPageChipDragDebug('finish-reorder-save', { orderCount: orderIds.length });
+        // Batch reorder: the whole selection (snapshot taken when the drag
+        // armed) moves together to the drop point. Rows from other cards are
+        // simply not present in this list, so they are ignored here.
+        const movingIds = getMovingPageChipIds();
+        const orderIds = buildBatchOrderedIdsFromList(targetListEl, movingIds);
+        logPageChipDragDebug('finish-reorder-save', { orderCount: orderIds.length, moving: movingIds.join(',') });
         await saveGroupTabRowOrder(sourceGroupKey, orderIds);
-        if (draggedPageChipEl && pageChipPlaceholderEl) {
-          targetListEl.insertBefore(draggedPageChipEl, pageChipPlaceholderEl);
+        if (pageChipPlaceholderEl && movingIds.length) {
+          const movingSet = new Set(movingIds);
+          const movingEls = [...targetListEl.querySelectorAll('[data-chip-sort-id]')]
+            .filter(el => movingSet.has(String(el.dataset.chipSortId || '')));
+          for (const el of movingEls) targetListEl.insertBefore(el, pageChipPlaceholderEl);
         }
-        requiresOpenTabsRebuild = false;
+        // User-created Chrome group cards persist their in-group order to the
+        // native group too (syncChromeTabGroups skips them by design).
+        const sourceGroup = getDomainGroupByKey(sourceGroupKey);
+        if (sourceGroup?.isChromeGroup && sourceGroup.chromeGroupId != null
+            && typeof reorderGroupedTabs === 'function') {
+          const windowId = sourceGroup.tabs?.[0]?.windowId;
+          if (windowId != null) {
+            await reorderGroupedTabs(Number(sourceGroup.chromeGroupId), orderIds.map(String), windowId);
+          }
+        }
+        // Defensive: the order was persisted from the placeholder position; if
+        // the placeholder is somehow missing, fall back to a full re-render so
+        // the DOM cannot diverge from the stored order.
+        requiresOpenTabsRebuild = !pageChipPlaceholderEl;
       } else if (targetGroupKey) {
-        const movedGroup = await moveDraggedPageChipToGroup(targetGroupKey);
+        const movedGroup = await moveDraggedPageChipToGroup(targetGroupKey, targetListEl);
         if (movedGroup) {
           disableChromeTabGroupsImportModeForLocalEdits();
           changedGroupKeys.add(sourceGroupKey);
+          for (const g of (movedGroup.sourceGroupKeys || [])) changedGroupKeys.add(g);
           changedGroupKeys.add(movedGroup.groupKey);
           if (!movedGroup.targetWasManualGroup) {
             const nextGroupOrder = buildPersistentGroupOrderReplacingKey(movedGroup.groupKey, targetGroupKey);
             await persistGroupOrder(nextGroupOrder);
           }
           logPageChipDragDebug('finish-save-cross-order', { groupKey: movedGroup.groupKey });
-          await saveCrossGroupTabRowOrder(sourceGroupKey, movedGroup.groupKey, targetListEl, draggedPageChipId);
+          await saveCrossGroupTabRowOrder(sourceGroupKey, movedGroup.groupKey, targetListEl, getMovingPageChipIds());
           logPageChipDragDebug('finish-group-move', { groupKey: movedGroup.groupKey, groupName: movedGroup.groupName });
+          // The rows left their cards — clear the selection so no residual
+          // highlight lingers in the new group and invites an accidental re-drag.
+          clearPageChipSelection();
         }
       } else if (createNewGroup) {
+        // Leaving a user-created Chrome group card detaches the batch from its
+        // native group; the new manual group stays dashboard-internal.
+        // Ungroup EVERY moving tab that currently lives in a Chrome group, not
+        // just the anchor chip's source card (C23).
+        if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+        const allMovingCollected = collectMovingTabIds(getMovingPageChipIds(), '');
+        const chromeOwnedMovingTabIds = allMovingCollected.tabIds.filter(id => {
+          const tab = openTabs.find(t => Number(t.id) === Number(id));
+          return tab && Number.isInteger(tab.groupId) && tab.groupId >= 0;
+        });
+        if (chromeOwnedMovingTabIds.length) {
+          try {
+            await ungroupTabsWithStaleRetry(chromeOwnedMovingTabIds);
+          } catch (err) {
+            console.warn('[tab-harbor] create-new-group: ungroup failed:', err);
+            showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not leave Chrome tab group');
+            clearPageChipDragState({ removeNode: false });
+            return false;
+          }
+        }
         const createdGroup = await createSessionGroupFromDraggedPageChip();
         if (createdGroup) {
           disableChromeTabGroupsImportModeForLocalEdits();
           changedGroupKeys.add(sourceGroupKey);
+          for (const g of (createdGroup.sourceGroupKeys || [])) changedGroupKeys.add(g);
           const createdGroupKey = `${MANUAL_GROUP_PREFIX}${createdGroup.id}`;
           changedGroupKeys.add(createdGroupKey);
           const nextGroupOrder = buildPersistentGroupOrderWithInsertedGroup(createdGroupKey, {
@@ -2241,7 +3436,18 @@ async function finishPageChipDrag() {
             orderCount: nextGroupOrder.length,
           });
           logPageChipDragDebug('finish-new-group', { groupName: createdGroup.name });
+          // Same as cross-group moves: the batch now lives in a fresh group,
+          // so drop the selection to avoid residual highlights.
+          clearPageChipSelection();
         }
+      } else {
+        // Dropped outside any valid target (dead zone): cancel the drag and
+        // restore the rows. Removing them here would hide open tabs from the
+        // view until the next full render, since the source card is not
+        // patched in this path.
+        logPageChipDragDebug('finish-dead-zone-cancel', { moved });
+        clearPageChipDragState({ removeNode: false });
+        return true;
       }
 
       clearPageChipDragState({ removeNode: requiresOpenTabsRebuild });
@@ -2270,6 +3476,8 @@ async function finishPageChipDrag() {
       message: error?.message || String(error),
     });
     throw error;
+  } finally {
+    pageChipCommitInFlight = false;
   }
 }
 
@@ -2393,68 +3601,31 @@ async function removeTabAssignments(tabIds = []) {
 }
 
 /**
- * closeTabsByUrls(urls)
+ * ensureWindowsKeepLastTab(allTabs, toCloseIds)
  *
- * Closes all open tabs whose hostname matches any of the given URLs.
- * After closing, re-fetches the tab list to keep our state accurate.
- *
- * Special case: file:// URLs are matched exactly (they have no hostname).
+ * Never close the last tab of any window: removing a window's final tab
+ * closes the window, and removing the final tab of the last window exits
+ * the browser. Returns the ids that may safely be closed.
  */
-async function closeTabsByUrls(urls) {
-  if (!urls || urls.length === 0) return;
-
-  // Separate file:// URLs (exact match) from regular URLs (hostname match)
-  const targetHostnames = [];
-  const exactUrls = new Set();
-
-  for (const u of urls) {
-    const canonicalUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(u) : u;
-    if (canonicalUrl.startsWith('file://')) {
-      exactUrls.add(canonicalUrl);
-    } else {
-      try { targetHostnames.push(new URL(canonicalUrl).hostname); }
-      catch { /* skip unparseable */ }
+function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
+  const toCloseSet = new Set(toCloseIds || []);
+  const winIds = new Set(allTabs.filter(t => toCloseSet.has(t.id)).map(t => t.windowId));
+  for (const winId of winIds) {
+    const winTabs = allTabs.filter(t => t.windowId === winId);
+    if (winTabs.length > 0 && winTabs.every(t => toCloseSet.has(t.id))) {
+      const keep = winTabs.find(t => t.active) || winTabs[0];
+      toCloseSet.delete(keep.id);
     }
   }
-
-  const allTabs = await queryTabsForDashboardWindow();
-  const toClose = allTabs
-    .filter(tab => {
-      const tabUrl = getTabCanonicalUrl(tab);
-      if (tabUrl.startsWith('file://') && exactUrls.has(tabUrl)) return true;
-      try {
-        const tabHostname = new URL(tabUrl).hostname;
-        return tabHostname && targetHostnames.includes(tabHostname);
-      } catch { return false; }
-    })
-    .map(tab => tab.id);
-
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+  return [...toCloseSet];
 }
 
 /**
- * closeTabsExact(urls)
+ * focusTab(url, tabId = null)
  *
- * Closes tabs by exact URL match (not hostname). Used for landing pages
- * so closing "Gmail inbox" doesn't also close individual email threads.
- */
-async function closeTabsExact(urls) {
-  if (!urls || urls.length === 0) return;
-  const urlSet = new Set(urls.map(url => runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url));
-  const allTabs = await queryTabsForDashboardWindow();
-  const toClose = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
-}
-
-/**
- * focusTab(url)
- *
- * Switches Chrome to the tab with the given URL (exact match first,
- * then hostname fallback). Also brings the window to the front.
+ * Switches Chrome to a tab: a numeric tabId wins, otherwise the URL is
+ * matched (exact match first, then hostname fallback). Also brings the
+ * window to the front.
  */
 async function focusTab(url, tabId = null) {
   if (!url && !tabId) return;
@@ -2501,8 +3672,48 @@ async function focusTab(url, tabId = null) {
   return true;
 }
 
+/**
+ * normalizeNewTabUrlForComparison(url)
+ *
+ * The focus-redirect appends `?focus=1` to the new-tab page URL (see
+ * focus-redirect.js). A Tab Harbor new-tab page may therefore appear with or
+ * without that query across different tabs/windows. Strip query + hash so the
+ * comparison identifies the page regardless of the focus parameter.
+ */
+function normalizeNewTabUrlForComparison(rawUrl = '') {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return String(rawUrl).split(/[?#]/)[0] || rawUrl;
+  }
+}
+
+function isTabHarborNewTabUrl(rawUrl = '') {
+  const url = String(rawUrl || '');
+  // Chrome maps the overridden new tab to chrome://newtab/; Edge (which can
+  // also load this extension) maps it to edge://newtab/. When the auto-focus
+  // redirect is disabled the tab keeps that URL, so it must still count as a
+  // Tab Harbor page for the duplicate count and the close-extras banner.
+  if (url === 'chrome://newtab/' || url === 'edge://newtab/') return true;
+  // The current page IS a Tab Harbor new-tab page; compare normalized forms so
+  // the ?focus=1 query (and any hash) does not break the match.
+  return normalizeNewTabUrlForComparison(url) === normalizeNewTabUrlForComparison(window.location.href);
+}
+
 async function navigateCurrentTabToUrl(url) {
   if (!url) return false;
+  // Prefer the dashboard's own cached tab id when it is still live — this
+  // skips a chrome.tabs.query round-trip so the search navigation starts
+  // immediately (a real-perceived-latency win on the search submit path).
+  if (currentDashboardTabId != null) {
+    try {
+      await chrome.tabs.update(currentDashboardTabId, { url });
+      return true;
+    } catch {
+      // Tab was replaced/closed; fall through to the query path.
+    }
+  }
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!activeTab?.id) return false;
   await chrome.tabs.update(activeTab.id, { url });
@@ -2515,9 +3726,54 @@ async function openOrFocusUrl(url) {
   return true;
 }
 
+function syncSearchPlaceholder() {
+  const input = document.getElementById('headerSearchInput');
+  if (!input) return;
+  const engine = runtimeGetSearchEngine ? runtimeGetSearchEngine() : 'default';
+  let placeholder = '';
+  if (engine === 'custom') {
+    const customUrl = ((typeof themePreferences !== 'undefined' && themePreferences.customSearchUrl) || '').trim();
+    placeholder = customUrl
+      ? (runtimeT ? runtimeT('searchPlaceholderCustom') : 'Search with a custom engine...')
+      : (runtimeT ? runtimeT('searchPlaceholderDefault') : 'Search with your default engine...');
+  } else if (engine !== 'default') {
+    const labelKey = SEARCH_ENGINE_LABEL_KEYS[engine] || '';
+    const engineName = labelKey
+      ? (runtimeT ? runtimeT(labelKey) : (runtimeSearchEnginePresets?.[engine]?.name || ''))
+      : (runtimeSearchEnginePresets?.[engine]?.name || '');
+    placeholder = runtimeT
+      ? runtimeT('searchPlaceholderEngine', { engine: engineName })
+      : `Search with ${engineName}...`;
+  } else {
+    placeholder = runtimeT ? runtimeT('searchPlaceholderDefault') : 'Search with your default engine...';
+  }
+  input.setAttribute('placeholder', placeholder);
+  const hint = document.getElementById('headerSearchSuggestionsHint');
+  if (hint) {
+    hint.textContent = runtimeT ? runtimeT('suggestHintArrows') : 'Use ↑↓ to move, Enter to open';
+  }
+}
+
 async function runDefaultSearch(query) {
   const text = String(query || '').trim();
   if (!text) return;
+
+  const searchUrl = runtimeBuildSearchUrlForQuery ? runtimeBuildSearchUrlForQuery(text) : '';
+  if (searchUrl) {
+    let validSearchUrl = false;
+    try {
+      validSearchUrl = /^https?:$/.test(new URL(searchUrl).protocol);
+    } catch {
+      validSearchUrl = false;
+    }
+    if (validSearchUrl) {
+      const navigated = await navigateCurrentTabToUrl(searchUrl).catch(() => false);
+      if (navigated) return;
+      // Navigation failed (rare) — fall through to the browser search path.
+    } else {
+      showToast(runtimeT ? runtimeT('toastInvalidCustomSearchUrl') : 'Invalid custom search URL, using browser default');
+    }
+  }
 
   if (chrome.search?.query) {
     await chrome.search.query({
@@ -2531,48 +3787,653 @@ async function runDefaultSearch(query) {
   await navigateCurrentTabToUrl(fallbackUrl);
 }
 
-/**
- * closeDuplicateTabs(urls, keepOne)
- *
- * Closes duplicate tabs for the given list of URLs.
- * keepOne=true → keep one copy of each, close the rest.
- * keepOne=false → close all copies.
- */
-async function closeDuplicateTabs(urls, keepOne = true) {
-  const allTabs = await queryTabsForDashboardWindow();
-  const toClose = [];
+/* ----------------------------------------------------------------
+   SEARCH SUGGESTIONS — inline panel under the header search field
+   ----------------------------------------------------------------
+   Sources (union, de-duplicated by URL):
+     1. open tabs in the current window (type 'tab')
+     2. quick shortcuts (type 'shortcut')
+     3. saved session tabs (type 'session')
+     4. browser history (type 'history') — only when chrome.history exists
+   The panel is keyboard-navigable (ArrowUp/Down, Enter, Escape) and follows
+   the quiet visual language of the rest of the dashboard.
+   ---------------------------------------------------------------- */
 
-  for (const url of urls) {
-    const targetUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url;
-    const matching = allTabs.filter(t => getTabCanonicalUrl(t) === targetUrl);
-    if (keepOne) {
-      const keep = matching.find(t => t.active) || matching[0];
-      for (const tab of matching) {
-        if (tab.id !== keep.id) toClose.push(tab.id);
+const SEARCH_SUGGESTION_SOURCES = ['tab', 'shortcut', 'session', 'history'];
+const SEARCH_SUGGESTIONS_MAX = 12;
+const SEARCH_HISTORY_CACHE_TTL_MS = 30000;
+const SEARCH_SUGGESTION_DEBOUNCE_MS = 120;
+
+function getSearchSuggestionsInput() {
+  return document.getElementById('headerSearchInput');
+}
+
+function getSearchSuggestionsPanel() {
+  return document.getElementById('headerSearchSuggestions');
+}
+
+function searchSuggestionsAvailable() {
+  return typeof chrome !== 'undefined' && !!chrome.history && typeof chrome.history.search === 'function';
+}
+
+function getSearchSuggestionSectionLabel(type) {
+  switch (type) {
+    case 'tab': return runtimeT ? runtimeT('suggestSectionTabs') : 'Open tabs';
+    case 'shortcut': return runtimeT ? runtimeT('suggestSectionShortcuts') : 'Quick links';
+    case 'session': return runtimeT ? runtimeT('suggestSectionSessions') : 'Saved sessions';
+    case 'history': return runtimeT ? runtimeT('suggestSectionHistory') : 'History';
+    default: return '';
+  }
+}
+
+async function loadSearchSuggestionSources() {
+  // Tabs come from the dashboard's own in-memory snapshot (already filtered to
+  // the current window and canonicalized).
+  const tabs = getRealTabs().map(tab => ({
+    id: tab.id,
+    url: tab.url,
+    title: tab.title,
+    favIconUrl: tab.favIconUrl || '',
+    windowId: tab.windowId,
+  }));
+
+  // Read shortcuts and sessions in parallel: both are independent
+  // chrome.storage calls, and running them concurrently keeps the whole
+  // suggestion refresh shorter, so fewer chrome.* calls are still queued when
+  // the user hits Enter to search.
+  const [shortcuts, sessions] = await Promise.all([
+    (async () => {
+      if (typeof globalThis.TabOutThemeControls?.getQuickShortcuts === 'function') {
+        return await globalThis.TabOutThemeControls.getQuickShortcuts();
       }
-    } else {
-      for (const tab of matching) toClose.push(tab.id);
+      return [];
+    })(),
+    (async () => {
+      if (typeof runtimeGetSavedTabSessions === 'function') {
+        return await runtimeGetSavedTabSessions();
+      }
+      return [];
+    })(),
+  ]);
+
+  return { tabs, shortcuts, sessions };
+}
+
+async function loadSearchHistoryCache() {
+  if (!searchSuggestionsAvailable()) {
+    searchSuggestionsHistoryCache = null;
+    return [];
+  }
+  const now = Date.now();
+  if (searchSuggestionsHistoryCache && now - searchSuggestionsHistoryCacheTime < SEARCH_HISTORY_CACHE_TTL_MS) {
+    return searchSuggestionsHistoryCache;
+  }
+  try {
+    // Empty text returns the most recent browsing history — exactly what a
+    // default (no-query) suggestion panel wants. Deeper filtering happens
+    // client-side against this bounded cache.
+    const items = await chrome.history.search({
+      text: '',
+      maxResults: 20,
+      startTime: 0,
+    });
+    searchSuggestionsHistoryCache = items.map(item => ({
+      url: item.url,
+      title: item.title || item.url,
+      visitCount: item.visitCount || 0,
+      lastVisitTime: item.lastVisitTime || 0,
+    }));
+    searchSuggestionsHistoryCacheTime = now;
+    return searchSuggestionsHistoryCache;
+  } catch (err) {
+    if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
+    console.warn('[tab-harbor] history search failed:', err);
+    searchSuggestionsHistoryCache = null;
+    return [];
+  }
+}
+
+async function refreshSearchSuggestions(force = false) {
+  const input = getSearchSuggestionsInput();
+  const panel = getSearchSuggestionsPanel();
+  if (!input || !panel) return;
+
+  // Capture the generation at start; if the user submits the search (or the
+  // page otherwise invalidates suggestions) mid-refresh, the in-flight
+  // chrome.* calls become stale and their results are discarded instead of
+  // being rendered — this keeps the suggestion refresh from contending with
+  // the navigation's chrome.* calls in the extension page's API queue.
+  const gen = searchSuggestionsGeneration;
+
+  const query = input.value || '';
+  if (query === searchSuggestionsQuery && !force) return;
+
+  // The panel only ever shows for a non-empty query: empty input means no
+  // suggestions, no matter who calls refresh (focus, tab change, debounce).
+  if (!query) {
+    closeSearchSuggestions();
+    return;
+  }
+
+  searchSuggestionsQuery = query;
+
+  const [sources, history] = await Promise.all([
+    loadSearchSuggestionSources(),
+    loadSearchHistoryCache(),
+  ]);
+  // A search was submitted (or the panel otherwise invalidated) while we were
+  // awaiting chrome.* — discard this stale refresh instead of rendering it.
+  if (gen !== searchSuggestionsGeneration) return;
+  const allRows = [
+    ...sources.tabs.map(tab => ({ type: 'tab', url: tab.url, title: tab.title || tab.url, favIconUrl: tab.favIconUrl, tabId: tab.id, windowId: tab.windowId })),
+    ...sources.shortcuts.map(shortcut => ({ type: 'shortcut', url: shortcut.url, title: shortcut.label || shortcut.url, label: shortcut.label || '', favIconUrl: shortcut.icon || '' })),
+    ...sources.sessions.map(session => ({
+      type: 'session',
+      url: session.url,
+      title: session.title || session.url,
+      label: session.label || '',
+      favIconUrl: session.favIconUrl || '',
+    })),
+    ...history.map(item => ({ type: 'history', url: item.url, title: item.title || item.url, favIconUrl: '', visitCount: item.visitCount, lastVisitTime: item.lastVisitTime })),
+  ];
+
+  let rows;
+  if (typeof globalThis.TabHarborSearchSuggestions?.filterSuggestions === 'function') {
+    rows = globalThis.TabHarborSearchSuggestions.filterSuggestions(allRows, query);
+  } else {
+    rows = allRows.slice(0, SEARCH_SUGGESTIONS_MAX);
+  }
+  searchSuggestionsRows = rows;
+
+  if (!rows.length) {
+    closeSearchSuggestions();
+    return;
+  }
+
+  openSearchSuggestions();
+  renderSearchSuggestions(rows, query);
+}
+
+function renderSearchSuggestions(rows = [], query = '') {
+  const panel = getSearchSuggestionsPanel();
+  if (!panel) return;
+
+  if (!rows.length) {
+    panel.innerHTML = '';
+    panel.hidden = true;
+    const input = getSearchSuggestionsInput();
+    if (input) input.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.type)) grouped.set(row.type, []);
+    grouped.get(row.type).push(row);
+  }
+
+  let html = '';
+  for (const type of SEARCH_SUGGESTION_SOURCES) {
+    const groupRows = grouped.get(type);
+    if (!groupRows || !groupRows.length) continue;
+    const label = getSearchSuggestionSectionLabel(type);
+    html += `<div class="header-search-suggestion-section" data-suggestion-section="${type}">`;
+    if (label) html += `<div class="header-search-suggestion-section-label">${runtimeEscapeHtml ? runtimeEscapeHtml(label) : label}</div>`;
+    groupRows.forEach(row => {
+      const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.title || row.url || '') : String(row.title || row.url || '').replace(/"/g, '&quot;');
+      const safeUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.url || '') : String(row.url || '').replace(/"/g, '&quot;');
+      const iconData = runtimeGetIconSources ? runtimeGetIconSources(row, 16, { allowExternalFavicon: row.type !== 'history' }) : { sources: [] };
+      const faviconUrl = iconData.sources?.[0] || '';
+      const fallbackUrl = iconData.sources?.[1] || '';
+      const fallbackLabel = runtimeGetFallbackLabel ? runtimeGetFallbackLabel(row.title || row.url, iconData.hostname) : '';
+      const safeFaviconUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(faviconUrl) : String(faviconUrl).replace(/"/g, '&quot;');
+      const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : String(fallbackUrl).replace(/"/g, '&quot;');
+      html += `<div class="header-search-suggestion-row" role="option" data-suggestion-type="${row.type}" data-suggestion-url="${safeUrl}" data-suggestion-tab-id="${row.tabId != null ? row.tabId : ''}" aria-selected="false" tabindex="-1">
+        <span class="header-search-suggestion-icon">${faviconUrl ? `<img src="${safeFaviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}">` : ''}</span>
+        <span class="header-search-suggestion-title">${runtimeEscapeHtml ? runtimeEscapeHtml(row.title || row.url) : String(row.title || row.url)}</span>
+        <span class="header-search-suggestion-url">${runtimeEscapeHtml ? runtimeEscapeHtml(row.url || '') : String(row.url || '')}</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  panel.innerHTML = html;
+  panel.hidden = false;
+  const input = getSearchSuggestionsInput();
+  if (input) input.setAttribute('aria-expanded', 'true');
+  setupSearchSuggestionImageFallbacks(panel);
+}
+
+function setupSearchSuggestionImageFallbacks(panel) {
+  panel.querySelectorAll('img[data-fallback-src]').forEach(img => {
+    if (img.dataset.errorHandlerAttached) return;
+    img.addEventListener('error', function handleSuggestionIconError() {
+      const fallbackSrc = this.dataset.fallbackSrc;
+      if (fallbackSrc && this.dataset.fallbackApplied !== 'true') {
+        this.dataset.fallbackApplied = 'true';
+        this.src = fallbackSrc;
+        return;
+      }
+      this.style.display = 'none';
+    });
+    img.dataset.errorHandlerAttached = 'true';
+  });
+}
+
+function openSearchSuggestions() {
+  const panel = getSearchSuggestionsPanel();
+  if (!panel) return;
+  searchSuggestionsOpen = true;
+  searchSuggestionsSelectedIndex = -1;
+  panel.hidden = false;
+}
+
+function closeSearchSuggestions({ restoreFocus = false } = {}) {
+  const panel = getSearchSuggestionsPanel();
+  if (panel) {
+    panel.hidden = true;
+    panel.innerHTML = '';
+  }
+  const input = getSearchSuggestionsInput();
+  if (input) input.setAttribute('aria-expanded', 'false');
+  searchSuggestionsOpen = false;
+  searchSuggestionsSelectedIndex = -1;
+  searchSuggestionsRows = [];
+  searchSuggestionsQuery = '';
+  if (searchSuggestionsDebounceTimer) {
+    clearTimeout(searchSuggestionsDebounceTimer);
+    searchSuggestionsDebounceTimer = null;
+  }
+  // Invalidate any in-flight suggestion refresh so its pending chrome.* calls
+  // are discarded (their results would be stale anyway) and do not contend
+  // with the navigation's chrome.* calls in the extension page API queue.
+  searchSuggestionsGeneration += 1;
+  if (restoreFocus && input) input.focus({ preventScroll: true });
+}
+
+function selectSearchSuggestionIndex(nextIndex) {
+  const rows = Array.from(document.querySelectorAll('.header-search-suggestion-row'));
+  if (!rows.length) return;
+  const count = rows.length;
+  if (nextIndex < 0) nextIndex = count - 1;
+  if (nextIndex >= count) nextIndex = 0;
+  searchSuggestionsSelectedIndex = nextIndex;
+
+  rows.forEach((row, index) => {
+    const selected = index === nextIndex;
+    row.classList.toggle('is-selected', selected);
+    row.setAttribute('aria-selected', String(selected));
+    if (selected) {
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+async function activateSearchSuggestion(row, { openInNewTab = false } = {}) {
+  if (!row) return;
+  const type = row.dataset.suggestionType || '';
+  const url = row.dataset.suggestionUrl || '';
+  const tabId = row.dataset.suggestionTabId || '';
+
+  if (type === 'tab' && tabId && !openInNewTab) {
+    const numericTabId = getTabIdValue(tabId);
+    if (numericTabId != null) {
+      closeSearchSuggestions();
+      try {
+        const targetTab = await chrome.tabs.get(numericTabId);
+        if (targetTab?.id != null) {
+          await chrome.tabs.update(targetTab.id, { active: true });
+          await chrome.windows.update(targetTab.windowId, { focused: true });
+          if (typeof syncChromeTabGroupExpansionForTab === 'function') {
+            await syncChromeTabGroupExpansionForTab(targetTab);
+          }
+          return;
+        }
+      } catch { /* fall through to URL open */ }
     }
   }
 
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+  if (!url) return;
+  closeSearchSuggestions();
+  if (openInNewTab) {
+    await chrome.tabs.create({ url, active: false }).catch(err => {
+      if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
+      console.warn('[tab-harbor] failed to open suggestion in new tab:', err);
+    });
+    return;
+  }
+  await openOrFocusUrl(url);
+}
+
+async function handleSearchSuggestionKeydown(e) {
+  const input = getSearchSuggestionsInput();
+  if (!input || document.activeElement !== input) return;
+
+  // An Enter while the input method editor (IME) is composing a candidate —
+  // e.g. a Chinese/Japanese input method where Enter confirms the chosen
+  // word — must NOT submit the search. Block the default submit and return;
+  // the search runs only on a "real" Enter outside composition.
+  if (e.key === 'Enter' && (searchSuggestionsIsComposing || e.isComposing)) {
+    e.preventDefault();
+    return;
+  }
+
+  // Enter always starts the search here (one event-loop turn earlier than the
+  // form submit), whether or not the suggestion panel is open. The panel is
+  // only relevant for picking a highlighted row.
+  if (e.key === 'Enter') {
+    // A key-repeat or fast double-press can fire a second Enter keydown while
+    // the first search is still awaiting its chrome.* calls. Guard the keydown
+    // path itself (the flag also gates the form-submit duplicate).
+    if (searchSubmitInFlight) {
+      e.preventDefault();
+      return;
+    }
+    if (searchSuggestionsOpen) {
+      const selected = document.querySelector('.header-search-suggestion-row.is-selected');
+      if (selected) {
+        e.preventDefault();
+        await activateSearchSuggestion(selected, { openInNewTab: e.ctrlKey || e.metaKey });
+        return;
+      }
+    }
+    // Nothing selected: start the search immediately from the keydown so the
+    // navigation begins a full event-loop turn earlier than waiting for the
+    // form submit. Prevent the submit listener from running it a second time.
+    e.preventDefault();
+    const query = input.value || '';
+    closeSearchSuggestions();
+    // Stop any pending self-focus retries before we navigate away — a timer
+    // firing during the teardown adds nothing and can contend with the
+    // navigation's chrome.* calls.
+    cancelSearchFocusRetryIfInteracting();
+    searchSubmitInFlight = true;
+    try {
+      await runDefaultSearch(query);
+    } finally {
+      // preventDefault on keydown stops the form submit, so the flag is never
+      // consumed by the submit listener; clear it here (a navigation usually
+      // unloads the page anyway, but an empty query must not leave it stuck).
+      searchSubmitInFlight = false;
+    }
+    return;
+  }
+
+  if (!searchSuggestionsOpen) return;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    selectSearchSuggestionIndex(searchSuggestionsSelectedIndex + 1);
+    return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    selectSearchSuggestionIndex(searchSuggestionsSelectedIndex - 1);
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSearchSuggestions({ restoreFocus: true });
+    return;
+  }
+}
+
+function shouldAutoFocusSearchField() {
+  const active = document.activeElement;
+  if (!active) return true;
+  if (active.id === 'headerSearchInput') return false;
+  // Never steal focus from another form field the user may be typing in.
+  const tag = active.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+  if (active.isContentEditable) return false;
+  return true;
+}
+
+// Retry schedule for claiming the search-field focus on new-tab load.
+// Chrome focuses the omnibox after a fresh newtab (Ctrl+T) renders, which can
+// override an earlier focus() call. Refresh-on-the-same-tab usually keeps the
+// focus, which is why Ctrl+T behaves differently. We retry across a wide
+// window (up to ~5s) with increasing delays, and stop as soon as the input
+// holds focus or the user interacts with the page.
+const SEARCH_FOCUS_RETRY_DELAYS_MS = [150, 400, 900, 1800, 3200, 5000];
+let searchFocusRetryTimer = null;
+let searchFocusRetryAttempt = 0;
+
+function focusSearchFieldOnForeground() {
+  // The auto-focus search toggle (Desk settings → Features) gates all
+  // foreground auto-focus, including the window focus / visibilitychange
+  // listeners below.
+  if (typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled === false) return;
+  if (!shouldAutoFocusSearchField()) return;
+  const input = getSearchSuggestionsInput();
+  if (!input) return;
+  // Avoid re-focusing in the same tick as a user click that just landed on
+  // another control (focusin fires after pointerdown on some platforms).
+  if (Date.now() < searchSuggestionsFocusGuardUntil) return;
+  input.focus({ preventScroll: true });
+  // Verify the focus actually landed; if the browser grabbed it back (e.g. the
+  // omnibox on a fresh newtab), retry on a short schedule.
+  scheduleSearchFocusVerification();
+}
+
+function scheduleSearchFocusVerification() {
+  if (searchFocusRetryTimer) clearTimeout(searchFocusRetryTimer);
+  searchFocusRetryTimer = null;
+  searchFocusRetryAttempt = 0;
+  const verify = () => {
+    const input = getSearchSuggestionsInput();
+    // The user took over (clicked elsewhere / typed) — stop retrying.
+    if (!input || document.activeElement === input) return;
+    if (!shouldAutoFocusSearchField()) return;
+    if (Date.now() < searchSuggestionsFocusGuardUntil) return;
+    if (searchFocusRetryAttempt >= SEARCH_FOCUS_RETRY_DELAYS_MS.length) return;
+    const delay = SEARCH_FOCUS_RETRY_DELAYS_MS[searchFocusRetryAttempt];
+    searchFocusRetryAttempt += 1;
+    searchFocusRetryTimer = setTimeout(() => {
+      searchFocusRetryTimer = null;
+      // Re-check right before focusing: if the user has since taken over
+      // (keyboard-navigated into another form field or contenteditable), do
+      // not yank focus away from them.
+      if (!shouldAutoFocusSearchField()) return;
+      input.focus({ preventScroll: true });
+      verify();
+    }, delay);
+  };
+  verify();
+}
+
+// A user interaction with the page (focus landed back on a page control) means
+// the user is using the workspace, not aiming at self-focus; stop retrying so
+// we never yank focus mid-session.
+function cancelSearchFocusRetryIfInteracting() {
+  if (searchFocusRetryTimer) clearTimeout(searchFocusRetryTimer);
+  searchFocusRetryTimer = null;
+  searchFocusRetryAttempt = SEARCH_FOCUS_RETRY_DELAYS_MS.length; // exhausted
+}
+
+/**
+ * Setup search-field focus + suggestion panel wiring. Called once from
+ * initializeDashboardRuntime so all listeners attach after the DOM is ready.
+ */
+function setupSearchSuggestions() {
+  const input = getSearchSuggestionsInput();
+  const panel = getSearchSuggestionsPanel();
+  if (!input || !panel) return;
+
+  const onFocus = () => {
+    // Focus alone must NOT open the panel — suggestions appear only once the
+    // user starts typing (see the input listener below).
+    if (getSearchSuggestionsInput()?.value) {
+      void refreshSearchSuggestions(true);
+    }
+  };
+  input.addEventListener('focus', onFocus);
+
+  // IME composition tracking: Enter inside composition confirms the selected
+  // candidate (e.g. Chinese input methods) and must not submit the search.
+  input.addEventListener('compositionstart', () => {
+    searchSuggestionsIsComposing = true;
+  });
+  input.addEventListener('compositionend', () => {
+    searchSuggestionsIsComposing = false;
+  });
+
+  input.addEventListener('input', () => {
+    // Only a non-empty query shows suggestions; clearing the field hides them.
+    const query = input.value || '';
+    if (!query) {
+      closeSearchSuggestions();
+      return;
+    }
+    if (searchSuggestionsDebounceTimer) clearTimeout(searchSuggestionsDebounceTimer);
+    searchSuggestionsDebounceTimer = setTimeout(() => {
+      searchSuggestionsDebounceTimer = null;
+      void refreshSearchSuggestions(true);
+    }, SEARCH_SUGGESTION_DEBOUNCE_MS);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    void handleSearchSuggestionKeydown(e);
+  });
+
+  // Clicking anywhere in the pill shell (the icon or the surrounding padding,
+  // but not the input itself) focuses the search input. Clicking the input is
+  // already handled natively; clicking a suggestion row is handled by the
+  // panel listener below and must not be redirected here.
+  const shell = document.querySelector('.header-search-shell');
+  if (shell) {
+    shell.addEventListener('click', (e) => {
+      if (e.target.closest('#headerSearchInput')) return;
+      cancelSearchFocusRetryIfInteracting();
+      input.focus({ preventScroll: true });
+    });
+  }
+
+  // Clicking a suggestion row activates it (Ctrl/Cmd opens in new tab).
+  panel.addEventListener('mousedown', (e) => {
+    // Prevent the input from losing focus before the click handler runs.
+    e.preventDefault();
+  });
+  panel.addEventListener('click', async (e) => {
+    const row = e.target.closest('.header-search-suggestion-row');
+    if (!row) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await activateSearchSuggestion(row, { openInNewTab: e.ctrlKey || e.metaKey });
+  });
+
+  // Close when the user clicks anywhere outside the search form.
+  document.addEventListener('pointerdown', (e) => {
+    if (!searchSuggestionsOpen) return;
+    if (e.target.closest('#headerSearchForm')) return;
+    closeSearchSuggestions();
+  });
+
+  // The user clicked into the page: they are using the workspace, not waiting
+  // for the search field to claim focus. Stop the self-focus retry loop.
+  document.addEventListener('pointerdown', () => {
+    cancelSearchFocusRetryIfInteracting();
+  }, { capture: true, passive: true });
+
+  // Same for keyboard navigation: once the user presses a key (Tab, arrows,
+  // typing elsewhere), they have taken over — never steal focus on the next
+  // retry tick.
+  document.addEventListener('keydown', () => {
+    cancelSearchFocusRetryIfInteracting();
+  }, { capture: true, passive: true });
+
+  // Refresh the panel when tabs change (openTabs re-render) so open-tab
+  // suggestions stay current while the panel is open.
+  if (typeof window.__tabHarborSuggestionsRefresh === 'undefined') {
+    window.__tabHarborSuggestionsRefresh = () => {
+      if (searchSuggestionsOpen) void refreshSearchSuggestions(true);
+    };
+  }
+}
+
+
+/**
+ * groupTabsWithStaleRetry(tabIds)
+ *
+ * chrome.tabs.group fails atomically when any id is invalid (a tab closed or
+ * was replaced between render and click). Drop ids that no longer exist —
+ * verified with chrome.tabs.get — and retry once with the survivors; if that
+ * still fails (or nothing was stale), rethrow so the caller can toast.
+ * Returns { groupId, mergedTabIds } so callers can report/clean up using the
+ * actual tabs that were grouped, not the pre-retry list.
+ */
+async function groupTabsWithStaleRetry(tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
+  try {
+    const groupId = await chrome.tabs.group({ tabIds: initialIds });
+    return { groupId, mergedTabIds: initialIds };
+  } catch (err) {
+    const liveIds = [];
+    for (const id of initialIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    const groupId = await chrome.tabs.group({ tabIds: liveIds });
+    return { groupId, mergedTabIds: liveIds };
+  }
+}
+
+/**
+ * groupTabsWithStaleRetryIntoGroup(groupId, tabIds)
+ *
+ * Same stale-retry contract as groupTabsWithStaleRetry, but joins an existing
+ * Chrome tab group instead of creating a new one. Used by drag-into-Chrome-group
+ * so a single closed tab cannot silently abort the whole move while still
+ * surfacing real API failures (e.g. pinned tabs).
+ */
+async function groupTabsWithStaleRetryIntoGroup(groupId, tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
+  try {
+    return await chrome.tabs.group({ groupId, tabIds: initialIds });
+  } catch (err) {
+    const liveIds = [];
+    for (const id of initialIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    return chrome.tabs.group({ groupId, tabIds: liveIds });
+  }
+}
+
+/**
+ * ungroupTabsWithStaleRetry(tabIds)
+ *
+ * Retry ungroup with only live tab ids when the first atomic call fails. If no
+ * ids survive or none were stale, rethrow so callers can show a failure instead
+ * of silently writing local state that contradicts the browser.
+ */
+async function ungroupTabsWithStaleRetry(tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
+  if (!initialIds.length) return;
+  try {
+    return await chrome.tabs.ungroup(initialIds);
+  } catch (err) {
+    const liveIds = [];
+    for (const id of initialIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    return chrome.tabs.ungroup(liveIds);
+  }
 }
 
 /**
  * closeTabOutDupes()
  *
  * Closes all duplicate Tab Harbor new-tab pages except the current one.
+ * The close itself goes through closeTabsSafely so the shared
+ * window-last-tab protection applies: a window whose ONLY tab would be
+ * closed keeps it instead of closing the window.
  */
 async function closeTabOutDupes() {
-  const newtabUrl = window.location.href;
-
   const allTabs = await queryTabsForDashboardWindow();
   const currentWindow = await chrome.windows.getCurrent();
-  const tabOutTabs = allTabs.filter(t =>
-    t.url === newtabUrl || t.url === 'chrome://newtab/'
-  );
+  const tabOutTabs = allTabs.filter(t => isTabHarborNewTabUrl(t.url));
 
   if (tabOutTabs.length <= 1) return;
 
@@ -2583,7 +4444,7 @@ async function closeTabOutDupes() {
     tabOutTabs.find(t => t.active) ||
     tabOutTabs[0];
   const toClose = tabOutTabs.filter(t => t.id !== keep.id).map(t => t.id);
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
+  if (toClose.length > 0) await closeTabsSafely(toClose, { playSound: false });
   await fetchOpenTabs();
 }
 
@@ -2596,12 +4457,181 @@ async function closeTabOutDupes() {
 async function discardTab(tabId) {
   if (!tabId) return false;
   try {
-    await chrome.tabs.discard(Number(tabId));
+    const discardedTab = await chrome.tabs.discard(Number(tabId));
+    const returnedTabId = Number(discardedTab?.id);
+    if (Number.isFinite(returnedTabId) && returnedTabId >= 0 && returnedTabId !== Number(tabId)) {
+      await queueSessionGroupTabReplacementMigration(returnedTabId, Number(tabId));
+    }
     return true;
   } catch (err) {
     console.error('Failed to discard tab:', err);
     return false;
   }
+}
+
+// Restoring a session can create many background tabs at once. Keep one
+// event-driven queue for their post-navigation sleep operation instead of one
+// 100 ms polling loop per tab. The timeout is only the first retry deadline;
+// it must never silently abandon a tab that is still loading.
+const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+const RESTORED_TAB_DISCARD_RETRY_MS = 1000;
+const restoredTabDiscardQueue = new Map();
+let restoredTabDiscardDeadlineTimer = null;
+let restoredTabDiscardListenersAttached = false;
+
+function getRestoredTabNavigationIdentity(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (typeof runtimeGetCanonicalTabUrl === 'function') {
+    try {
+      return String(runtimeGetCanonicalTabUrl(raw) || raw);
+    } catch {}
+  }
+  try {
+    return new URL(raw).href;
+  } catch {
+    return raw;
+  }
+}
+
+// Only a real web destination proves a committed navigation worth sleeping.
+// Error and interstitial pages (chrome-error://chromewebdata/,
+// about:blank#blocked, browser-internal urls) also report status 'complete',
+// but discarding one would sleep a tab that holds no restored content and can
+// never reload the saved URL.
+function isWebNavigationUrl(url) {
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'file:' || protocol === 'ftp:';
+  } catch {
+    return false;
+  }
+}
+
+function isRestoredTabNavigationReady(liveTab, targetUrl, changeInfo = {}) {
+  const liveUrl = String(changeInfo?.url || liveTab?.url || '').trim();
+  if (!liveUrl || liveUrl === 'about:blank' || liveUrl === 'chrome://newtab/' || liveUrl === 'edge://newtab/') return false;
+
+  // The normal case should match the saved URL. A completed redirect is also
+  // safe to sleep: the tab has a committed destination, while a loading
+  // redirect is left alone until Chrome reports the completed state.
+  if (getRestoredTabNavigationIdentity(liveUrl) === getRestoredTabNavigationIdentity(targetUrl)) return true;
+  // The completed-redirect fallback must never accept an error page: a failed
+  // load lands on chrome-error://chromewebdata/ with status 'complete', which
+  // looks exactly like a finished redirect unless the destination is checked.
+  if (!isWebNavigationUrl(getRestoredTabNavigationIdentity(liveUrl))) return false;
+  return changeInfo?.status === 'complete' || liveTab?.status === 'complete';
+}
+
+function removeRestoredTabDiscard(tabId) {
+  restoredTabDiscardQueue.delete(Number(tabId));
+  scheduleRestoredTabDiscardDeadline();
+}
+
+function scheduleRestoredTabDiscardDeadline() {
+  if (restoredTabDiscardDeadlineTimer != null) {
+    clearTimeout(restoredTabDiscardDeadlineTimer);
+    restoredTabDiscardDeadlineTimer = null;
+  }
+  let nextDeadline = Infinity;
+  for (const entry of restoredTabDiscardQueue.values()) {
+    nextDeadline = Math.min(nextDeadline, entry.deadline);
+  }
+  if (!Number.isFinite(nextDeadline)) return;
+
+  restoredTabDiscardDeadlineTimer = setTimeout(() => {
+    restoredTabDiscardDeadlineTimer = null;
+    const now = Date.now();
+    for (const [tabId, entry] of restoredTabDiscardQueue.entries()) {
+      if (entry.deadline > now) continue;
+      // A slow navigation must not opt out of the restore-sleep contract. The
+      // normal path is tabs.onUpdated; this state check is the missed-event
+      // fallback. If the tab is still blank/active or Chrome rejects the
+      // discard, keep it queued and retry instead of leaving a fully-live
+      // restored page behind forever.
+      entry.deadline = now + RESTORED_TAB_DISCARD_RETRY_MS;
+      void chrome.tabs.get(Number(tabId))
+        .then(liveTab => tryDiscardRestoredTabAfterCommit(Number(tabId), liveTab))
+        .catch(() => removeRestoredTabDiscard(Number(tabId)));
+    }
+    scheduleRestoredTabDiscardDeadline();
+  }, Math.max(0, nextDeadline - Date.now()));
+}
+
+async function tryDiscardRestoredTabAfterCommit(tabId, liveTab, changeInfo = {}) {
+  const numericId = Number(tabId);
+  const entry = restoredTabDiscardQueue.get(numericId);
+  if (!entry) return false;
+  if (!isRestoredTabNavigationReady(liveTab, entry.targetUrl, changeInfo)) return false;
+  // Chrome refuses to discard the active tab. Keep the request alive so a
+  // transient activation during restore does not permanently defeat sleep.
+  if (liveTab?.active === true) return false;
+
+  const discarded = await discardTab(numericId);
+  if (discarded) {
+    removeRestoredTabDiscard(numericId);
+  } else {
+    entry.deadline = Date.now() + RESTORED_TAB_DISCARD_RETRY_MS;
+    scheduleRestoredTabDiscardDeadline();
+  }
+  return discarded;
+}
+
+function ensureRestoredTabDiscardListeners() {
+  if (restoredTabDiscardListenersAttached || typeof chrome === 'undefined') return;
+  const onUpdated = chrome.tabs?.onUpdated;
+  const onRemoved = chrome.tabs?.onRemoved;
+  if (!onUpdated || typeof onUpdated.addListener !== 'function') return;
+
+  onUpdated.addListener((tabId, changeInfo, tab) => {
+    void tryDiscardRestoredTabAfterCommit(tabId, tab, changeInfo);
+  });
+  if (onRemoved && typeof onRemoved.addListener === 'function') {
+    onRemoved.addListener(tabId => removeRestoredTabDiscard(tabId));
+  }
+  const onActivated = chrome.tabs?.onActivated;
+  if (onActivated && typeof onActivated.addListener === 'function') {
+    onActivated.addListener(activeInfo => {
+      const tabId = Number(activeInfo?.tabId);
+      if (!Number.isFinite(tabId) || !restoredTabDiscardQueue.has(tabId)) return;
+      void chrome.tabs.get(tabId)
+        .then(liveTab => tryDiscardRestoredTabAfterCommit(tabId, liveTab))
+        .catch(() => removeRestoredTabDiscard(tabId));
+    });
+  }
+  restoredTabDiscardListenersAttached = true;
+}
+
+/**
+ * discardRestoredTabAfterCommit(tabId, targetUrl)
+ *
+ * Discards a freshly-created restored tab once its navigation has committed
+ * (the tab's url is no longer blank/about:blank). Discarding a tab while its
+ * navigation is still pending cancels the navigation and resets the tab to
+ * about:blank in Edge — the recorded URL is lost and activating the tab later
+ * would reload a blank page instead of the saved page. A one-time current-tab
+ * check handles an already-committed navigation; otherwise tabs.onUpdated
+ * drives the work. A shared retry timer handles missed update events and
+ * transient active/discard failures; the request is removed only after a
+ * successful discard or tab removal. Fire-and-forget: the restored id list
+ * is unaffected (discard keeps the tab id), and failures are retried quietly.
+ */
+function discardRestoredTabAfterCommit(tabId, targetUrl) {
+  const numericId = Number(tabId);
+  if (!Number.isFinite(numericId)) return;
+  restoredTabDiscardQueue.set(numericId, {
+    targetUrl: String(targetUrl || ''),
+    deadline: Date.now() + RESTORED_TAB_DISCARD_TIMEOUT_MS,
+  });
+  ensureRestoredTabDiscardListeners();
+  scheduleRestoredTabDiscardDeadline();
+
+  // The navigation may have committed before tabs.create resolved, in which
+  // case Chrome will not emit another update for us. Check exactly once; do
+  // not turn that race into a per-tab polling loop.
+  void chrome.tabs.get(numericId)
+    .then(liveTab => tryDiscardRestoredTabAfterCommit(numericId, liveTab))
+    .catch(() => removeRestoredTabDiscard(numericId));
 }
 
 
@@ -2635,71 +4665,81 @@ function getRealTabs() {
   });
 }
 
-/**
- * checkTabOutDupes()
- *
- * Counts how many Tab Harbor pages are open. If more than 1,
- * shows a banner offering to close the extras.
- */
-function checkTabOutDupes() {
-  const tabOutTabs = openTabs.filter(t => t.isTabOut);
-  const banner  = document.getElementById('tabOutDupeBanner');
-  const countEl = document.getElementById('tabOutDupeCount');
-  if (!banner) return;
-
-  if (tabOutTabs.length > 1) {
-    if (countEl) countEl.textContent = tabOutTabs.length;
-    banner.style.display = 'flex';
-  } else {
-    banner.style.display = 'none';
-  }
-}
-
 
 /* ----------------------------------------------------------------
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
 
-function buildOverflowChips(hiddenTabs, urlCounts = {}) {
-  const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
-    const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
-    const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
-    const iconData = runtimeGetIconSources(tab, 16);
-    const faviconUrl = iconData.sources[0] || '';
-    const fallbackUrl = iconData.sources[1] || '';
-    const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
-    const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
-    const safeTabId = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(String(tab.id || '')) : String(tab.id || '').replace(/"/g, '&quot;');
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" aria-label="${safeTitle}">
+/**
+ * buildPageChipHtml(tab, group, urlCounts, collapsed)
+ *
+ * Renders one open-tab row. Used for both the visible rows and the overflow
+ * rows (collapsed = true) so every row is identical: drag handle, sort id,
+ * group id, selection highlight and aria state. Collapsed rows stay in the
+ * list as direct children — hidden with a CSS class — so the drag machinery
+ * (placeholder, drop index, order save) treats them like any other row.
+ */
+function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
+  // Placeholder rows represent a tab id the openTabs snapshot has not
+  // materialized yet. They must not look like a real row with destructive
+  // controls (sleep) or an empty accessible name (C16).
+  const isPlaceholder = !tab.url && !tab.title && tab.id != null;
+  let label = isPlaceholder
+    ? (runtimeT ? runtimeT('chromeGroupPlaceholder') : 'Loading…')
+    : cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group?.domain || '');
+  // For localhost tabs, prepend port number so you can tell projects apart
+  if (!isPlaceholder) {
+    try {
+      const parsed = new URL(tab.url);
+      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
+    } catch {}
+  }
+  const count    = urlCounts[tab.url] || 1;
+  const sortId = getPrimaryTabOrderToken(tab);
+  const isSelected = selectedPageChipIds.has(String(sortId || ''));
+  const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${isSelected ? ' is-selected' : ''}${isPlaceholder ? ' page-chip--placeholder' : ''}${collapsed ? ' page-chip--collapsed' : ''}`;
+  const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
+  const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
+  const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
+  const safeSortId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(sortId) : String(sortId).replace(/"/g, '&quot;'));
+  const safeGroupId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(group?.domain || '') : String(group?.domain || '').replace(/"/g, '&quot;'));
+  const iconData = runtimeGetIconSources(tab, 16);
+  const faviconUrl = iconData.sources[0] || '';
+  const fallbackUrl = iconData.sources[1] || '';
+  const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
+  const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
+  // Chrome group cards tint their row drag handles with the native group
+  // color. The tint is exposed as a CSS variable (not an inline color) so the
+  // sheet's hover/focus rules can still recolor the handle (C29).
+  const chromeGroupColor = group?.isChromeGroup
+    ? (CHROME_GROUP_COLOR_MAP[group.chromeGroupColor] || (String(group.chromeGroupColor || '').startsWith('#') ? group.chromeGroupColor : ''))
+    : '';
+  return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
+      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}"${chromeGroupColor ? ` style="--chrome-group-color:${chromeGroupColor}"` : ''}>
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
+      </button>
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
       <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
-      <span class="chip-text">${safeLabel}</span>${dupeTag}
+      <span class="chip-text">${safeLabel}</span>
       <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active ? `
-        <button class="chip-action chip-discard" type="button" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
+        ${sleepControlEnabled && !tab.active && !tab.discarded && !isPlaceholder ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
-        </button>
-        ` : ''}
-        <button class="chip-action chip-session-save" type="button" data-action="save-single-tab-session" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
+        </button>` : ''}
+        ${!isPlaceholder ? `<button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
           ${ICONS.archive}
-        </button>
-        <button class="chip-action chip-close" type="button" data-action="close-single-tab" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
+        </button>` : ''}
+        ${!isPlaceholder ? `<button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
+        </button>` : ''}
       </div>
     </div>`;
-  }).join('');
+}
 
+function buildOverflowChips(extraCount) {
   return `
-    <div class="page-chips-overflow" style="display:none">${hiddenChips}</div>
-    <div class="page-chip page-chip-overflow clickable" data-action="expand-chips">
-      <span class="chip-text">${runtimeT ? runtimeT('moreCount', { count: hiddenTabs.length }) : `+${hiddenTabs.length} more`}</span>
-    </div>`;
+    <button type="button" class="page-chip page-chip-overflow clickable" data-action="expand-chips">
+      <span class="chip-text">${runtimeT ? runtimeT('moreCount', { count: extraCount }) : `+${extraCount} more`}</span>
+    </button>`;
 }
 
 
@@ -2708,10 +4748,9 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
    ---------------------------------------------------------------- */
 
 /**
- * renderDomainCard(group, groupIndex)
+ * renderDomainCard(group)
  *
- * Builds the HTML for one domain group card.
- * group = { domain: string, tabs: [{ url, title, id, windowId, active }] }
+ * Builds the HTML for one domain group card (domain, manual or Chrome group).
  */
 function renderDomainCard(group) {
   const tabs      = group.tabs || [];
@@ -2722,9 +4761,13 @@ function renderDomainCard(group) {
   const renameEditorValue = renameEditorOpen ? (groupRenameEditorState?.value || groupTitle) : groupTitle;
   const safeRenameValue = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(renameEditorValue) : String(renameEditorValue).replace(/"/g, '&quot;');
 
-  // Count duplicates (exact URL match)
+  // Count duplicates (exact URL match). Placeholder rows have no URL yet and
+  // must never look like duplicate tabs (C13).
   const urlCounts = {};
-  for (const tab of tabs) urlCounts[tab.url] = (urlCounts[tab.url] || 0) + 1;
+  for (const tab of tabs) {
+    if (!tab.url) continue;
+    urlCounts[tab.url] = (urlCounts[tab.url] || 0) + 1;
+  }
   const dupeUrls   = Object.entries(urlCounts).filter(([, c]) => c > 1);
   const hasDupes   = dupeUrls.length > 0;
   const totalExtras = dupeUrls.reduce((s, [, c]) => s + c - 1, 0);
@@ -2741,50 +4784,24 @@ function renderDomainCard(group) {
     : '';
 
   const orderedTabs = getOrderedUniqueTabsForGroup(group);
-  const visibleTabs = orderedTabs.slice(0, 8);
-  const extraCount  = orderedTabs.length - visibleTabs.length;
+  const extraCount  = Math.max(0, orderedTabs.length - 8);
 
-  const pageChips = visibleTabs.map(tab => {
-    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
-    // For localhost tabs, prepend port number so you can tell projects apart
-    try {
-      const parsed = new URL(tab.url);
-      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
-    } catch {}
-    const count    = urlCounts[tab.url];
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}`;
-    const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
-    const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
-    const sortId = getPrimaryTabOrderToken(tab);
-    const safeSortId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(sortId) : String(sortId).replace(/"/g, '&quot;'));
-    const safeGroupId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(group.domain) : String(group.domain).replace(/"/g, '&quot;'));
-    const iconData = runtimeGetIconSources(tab, 16);
-    const faviconUrl = iconData.sources[0] || '';
-    const fallbackUrl = iconData.sources[1] || '';
-    const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
-    const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
-      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-label="${runtimeT ? runtimeT('dragReorderTab') : 'Drag to reorder tab'}">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
-      </button>
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
-      <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
-      <span class="chip-text">${safeLabel}</span>${dupeTag}
-      <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
-          ${ICONS.moon}
-        </button>` : ''}
-        <button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
-          ${ICONS.archive}
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('') + (extraCount > 0 ? buildOverflowChips(orderedTabs.slice(8), urlCounts) : '');
+  // Mirror the per-row sleep rule (buildPageChipHtml): a row offers sleep
+  // only when its tab is awake, not active and materialized. When no row in
+  // the card can be slept — every tab asleep, active or a placeholder — the
+  // header's "sleep all in group" button is a guaranteed no-op and hides
+  // exactly like the rows' own sleep indicators do.
+  const hasSleepableTabs = orderedTabs.some(tab =>
+    !tab.active && !tab.discarded && !(!tab.url && !tab.title && tab.id != null));
+
+  // Every row (visible + overflow) goes through the same renderer, so the
+  // expanded "+N more" rows look and behave exactly like the first eight.
+  // Overflow rows are direct list children hidden with a CSS class — they
+  // keep their drag handles, sort ids and stored order. Cards whose overflow
+  // was expanded stay expanded across re-renders (drag commits, refreshes).
+  const isOverflowExpanded = expandedPageChipGroupKeys.has(String(group.domain));
+  const pageChips = orderedTabs.map((tab, index) => buildPageChipHtml(tab, group, urlCounts, index >= 8 && !isOverflowExpanded)).join('')
+    + (extraCount > 0 && !isOverflowExpanded ? buildOverflowChips(extraCount) : '');
 
   const saveGroupButton = `
       <button class="group-action-icon" type="button" data-action="save-domain-session" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('saveGroupSession') : 'Save group session'}" data-tooltip="${runtimeT ? runtimeT('saveGroupSession') : 'Save group session'}">
@@ -2795,19 +4812,31 @@ function renderDomainCard(group) {
         ${ICONS.close}
       </button>`;
 
-  let actionsHtml = '';
-  if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
-    actionsHtml += `
-      <button class="action-btn" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
-        ${runtimeT
-          ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
-          : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`}
-      </button>`;
-  }
+  const dupeUrlsEncoded = hasDupes ? dupeUrls.map(([url]) => encodeURIComponent(url)).join(',') : '';
+  // Header actions, left to right: close duplicates, merge into a Chrome
+  // group, sleep all in group, save session, close group. All are icon
+  // buttons in the same quiet header style (30×30, muted → ink on hover).
+  // A card that IS a Chrome group has no "merge into Chrome group" action.
+  const mergeGroupButton = group.isChromeGroup ? '' : `
+    <button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}">
+      ${ICONS.mergeGroup}
+    </button>`;
+  const dedupLabel = runtimeT
+    ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
+    : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`;
+  const dedupButton = hasDupes ? `
+    <button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" aria-label="${dedupLabel}" data-tooltip="${dedupLabel}">
+      ${ICONS.closeDuplicates}
+    </button>` : '';
 
+  // Chrome tab group colors: named enum colors map to dashboard accents, and
+  // Chrome 132+ custom colors come back as raw hex (#rrggbb) — pass those
+  // through unchanged so user group cards always wear their real color.
+  const chromeColor = group.isChromeGroup
+    ? (CHROME_GROUP_COLOR_MAP[group.chromeGroupColor] || (String(group.chromeGroupColor || '').startsWith('#') ? group.chromeGroupColor : ''))
+    : '';
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}" data-group-id="${group.domain}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}${group.isChromeGroup ? ' chrome-group-card' : ''}" data-domain-id="${stableId}" data-group-id="${group.domain}"${group.chromeGroupId != null ? ` data-chrome-group-id="${group.chromeGroupId}"` : ''}${chromeColor ? ` style="--chrome-group-color:${chromeColor}"` : ''}>
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -2826,7 +4855,9 @@ function renderDomainCard(group) {
             ${dupeBadge}
           </div>
           <div class="mission-actions">
-            ${sleepControlEnabled ? `
+            ${dedupButton}
+            ${mergeGroupButton}
+            ${sleepControlEnabled && hasSleepableTabs ? `
             <button class="group-action-icon" type="button" data-action="sleep-domain-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}">
               ${ICONS.moon}
             </button>` : ''}
@@ -2835,7 +4866,6 @@ function renderDomainCard(group) {
           </div>
         </div>
         <div class="mission-pages">${pageChips}</div>
-        ${actionsHtml ? `<div class="actions">${actionsHtml}</div>` : ''}
       </div>
       <div class="mission-meta">
         <div class="mission-page-count">${tabCount}</div>
@@ -2978,6 +5008,16 @@ function renderWorkspaceThemeTools() {
               <div class="theme-range-value" id="themeShortcutScaleValue">100%</div>
             </div>
           </div>
+          <div class="theme-menu-section">
+            <div class="theme-menu-row theme-menu-row-inline-choices">
+              <div class="theme-menu-label">${runtimeT ? runtimeT('quickShortcutColsLabel') : 'Quick links per row'}</div>
+              <div class="theme-mode-options" role="group" aria-label="${runtimeT ? runtimeT('quickShortcutColsLabel') : 'Quick links per row'}">
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === 'auto') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="auto" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === 'auto') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutColsAuto') : 'Auto'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '4') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="4" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '4') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutCols4') : '4 columns'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '5') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="5" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '5') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutCols5') : '5 columns'}</button>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="theme-menu-panel" id="themeMenuFeaturesPanel" role="tabpanel" aria-labelledby="themeMenuFeaturesTab" data-theme-menu-panel="features" hidden>
           <div class="theme-menu-section">
@@ -2988,8 +5028,8 @@ function renderWorkspaceThemeTools() {
           </div>
           <div class="theme-menu-section">
             <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
-              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.hitokotoEnabled !== false) ? 'is-active' : ''}" type="button" data-action="toggle-hitokoto" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.hitokotoEnabled !== false) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('hitokotoLabel') : '一言'}"></button>
-              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('hitokotoLabel') : '一言'}</span>
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.hitokotoEnabled !== false) ? 'is-active' : ''}" type="button" data-action="toggle-hitokoto" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.hitokotoEnabled !== false) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('hitokotoLabel') : 'Hitokoto'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('hitokotoLabel') : 'Hitokoto'}</span>
             </label>
           </div>
           <div class="theme-menu-section">
@@ -3000,12 +5040,49 @@ function renderWorkspaceThemeTools() {
           </div>
           <div class="theme-menu-section">
             <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
-              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-close-duplicate-new-tabs" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate new tabs'}"></button>
-              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate new tabs'}</span>
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-close-duplicate-new-tabs" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate Tab Harbors'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate Tab Harbors'}</span>
             </label>
           </div>
           <div class="theme-menu-section">
-            <div class="theme-menu-label">${runtimeT ? runtimeT('settingsExportImport') : 'Export & import'}</div>
+            <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-auto-focus-search" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('autoFocusSearchLabel') : 'Auto-focus search on new tab'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('autoFocusSearchLabel') : 'Auto-focus search on new tab'}</span>
+            </label>
+          </div>
+          <div class="theme-menu-section">
+            <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'is-active' : ''}" type="button" data-action="toggle-quick-shortcut-open-mode" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}</span>
+            </label>
+          </div>
+          <div class="theme-menu-section">
+            <div class="theme-menu-row theme-menu-row-inline-choices">
+              <div class="theme-menu-label">${runtimeT ? runtimeT('searchEngineLabel') : 'Search engine'}</div>
+              <div class="theme-mode-options" role="group" aria-label="${runtimeT ? runtimeT('searchEngineLabel') : 'Search engine'}">
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'default') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="default" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'default') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineDefault') : 'Browser default'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'google') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="google" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'google') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineGoogle') : 'Google'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'bing') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="bing" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'bing') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBing') : 'Bing'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'baidu') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="baidu" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'baidu') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBaidu') : 'Baidu'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'sogou') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="sogou" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'sogou') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineSogou') : 'Sogou'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'duckduckgo') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="duckduckgo" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'duckduckgo') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineDuckDuckGo') : 'DuckDuckGo'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'brave') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="brave" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'brave') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBrave') : 'Brave'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'yandex') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="yandex" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'yandex') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineYandex') : 'Yandex'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="custom" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineCustom') : 'Custom'}</button>
+              </div>
+            </div>
+          </div>
+          <div class="theme-menu-section" id="customSearchUrlSection"${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? '' : ' style="display:none"'}>
+            <div class="theme-menu-row theme-menu-row-inline-select">
+              <label class="theme-menu-label" for="customSearchUrlInput">${runtimeT ? runtimeT('customSearchUrlLabel') : 'Custom search URL'}</label>
+              <input class="theme-menu-text-input" id="customSearchUrlInput" type="text" data-action="change-custom-search-url" value="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(((typeof themePreferences !== 'undefined' && themePreferences.customSearchUrl) || '')) : ''}" placeholder="https://example.com/search?q={query}" aria-label="${runtimeT ? runtimeT('customSearchUrlLabel') : 'Custom search URL'}" aria-describedby="customSearchUrlHint" spellcheck="false">
+            </div>
+            <div class="theme-menu-row theme-menu-row-inline-select">
+              <div class="theme-menu-label theme-menu-hint" id="customSearchUrlHint">${runtimeT ? runtimeT('customSearchUrlHint') : 'Use {query} or %s as the placeholder'}</div>
+            </div>
+          </div>
+          <div class="theme-menu-section">
+            <div class="theme-menu-label">${runtimeT ? runtimeT('settingsExportImport') : 'Configuration backup'}</div>
             <div class="theme-menu-actions">
               <button class="theme-menu-action" type="button" data-action="export-config">${runtimeT ? runtimeT('settingsExport') : 'Export'}</button>
               <button class="theme-menu-action is-secondary" type="button" data-action="import-config">${runtimeT ? runtimeT('settingsImport') : 'Import'}</button>
@@ -3056,6 +5133,8 @@ async function handleConfigImportInput(inputEl) {
     const text = await file.text();
     const result = await configSync.importConfig(text);
     setThemeMenuOpen(false, { restoreFocus: true });
+    // Reset the input so selecting the same file again re-triggers change.
+    inputEl.value = '';
     showToast(runtimeT
       ? runtimeT('toastConfigImported', { keys: result.importedKeys.length })
       : `Imported ${result.importedKeys.length} setting${result.importedKeys.length !== 1 ? 's' : ''}`);
@@ -3066,11 +5145,33 @@ async function handleConfigImportInput(inputEl) {
   }
 }
 
+function renderTabOutDupeBanner(dupeExtras) {
+  // Only rendered when there are extra Tab Harbor tabs open (dupeExtras > 0).
+  // The banner sits to the left of the Home / Saved tabs page switch in the
+  // top nav; it re-renders with the nav on every openTabs refresh so it
+  // appears/disappears automatically.
+  if (!dupeExtras || dupeExtras <= 0) return '';
+  const label = runtimeT
+    ? runtimeT('closeExtrasLabel', { count: dupeExtras, suffix: dupeExtras !== 1 ? 's' : '' })
+    : `Close ${dupeExtras} extra tab${dupeExtras !== 1 ? 's' : ''}`;
+  return `
+    <div class="tab-cleanup-banner" id="tabOutDupeBanner">
+      <button class="tab-cleanup-btn" type="button" data-action="close-tabout-dupes" aria-label="${label}">
+        ${label}
+      </button>
+    </div>`;
+}
+
 function renderGroupNavArea(groups) {
+  // Count extra Tab Harbor tabs (all but the current one) to decide whether
+  // the cleanup banner shows and what number it carries.
+  const tabOutTabs = openTabs.filter(t => t.isTabOut);
+  const dupeExtras = tabOutTabs.length > 1 ? tabOutTabs.length - 1 : 0;
   return `
     <div class="group-nav-list" data-nav-kind="open-tabs">
       ${groups.map(group => renderGroupNav(group)).join('')}
     </div>
+    ${renderTabOutDupeBanner(dupeExtras)}
     ${renderWorkspacePageSwitch('home')}
     ${renderWorkspaceThemeTools()}`;
 }
@@ -3093,6 +5194,39 @@ function syncWorkspaceTopNavMarkup(markup = '', visible = true) {
   if (typeof renderThemeMenu === 'function') renderThemeMenu();
 }
 
+function buildOpenTabsSectionActions() {
+  // Section header above ALL cards, left to right: close duplicates (only
+  // while some card-visible URL is duplicated anywhere in the window), merge
+  // every open tab into one Chrome tab group, sleep all, save session, close
+  // all. Duplicates are counted over getRealTabs() — the same restorable-tab
+  // scope the cards show — so internal pages (chrome://, the dashboard's own
+  // new-tab page) never inflate the count.
+  const counts = {};
+  for (const tab of getRealTabs()) {
+    if (!tab?.url) continue;
+    counts[tab.url] = (counts[tab.url] || 0) + 1;
+  }
+  const dupeUrls = Object.entries(counts)
+    .filter(([, c]) => c > 1)
+    .map(([url]) => url);
+  const totalExtras = dupeUrls.reduce((sum, url) => sum + counts[url] - 1, 0);
+  const dedupLabel = runtimeT
+    ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
+    : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`;
+  const dupeUrlsEncoded = dupeUrls.map(url => encodeURIComponent(url)).join(',');
+
+  return `
+    ${dupeUrls.length > 0 ? `<button class="section-icon-action" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" aria-label="${dedupLabel}" data-tooltip="${dedupLabel}">
+      ${ICONS.closeDuplicates}
+    </button>` : ''}
+    <button class="section-icon-action" type="button" data-action="group-card-tabs" data-scope="all" aria-label="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}">
+      ${ICONS.mergeGroup}
+    </button>
+    ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllOpenTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllOpenTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
+    <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
+    <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+}
+
 function renderOpenTabsSummary(realTabs = getRealTabs()) {
   const openTabsSection      = document.getElementById('openTabsSection');
   const openTabsSectionCount = document.getElementById('openTabsSectionCount');
@@ -3104,10 +5238,7 @@ function renderOpenTabsSummary(realTabs = getRealTabs()) {
   if (domainGroups.length > 0) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
     if (openTabsSectionCount) {
-      openTabsSectionCount.innerHTML = `
-        ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
-        <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
-        <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+      openTabsSectionCount.innerHTML = buildOpenTabsSectionActions();
     }
     syncWorkspaceTopNavMarkup(renderGroupNavArea(domainGroups), true);
     if (openTabsMissionsEl) {
@@ -3185,11 +5316,12 @@ function patchOpenTabsDomFromGroups(realTabs = getRealTabs(), changedGroupKeys =
 }
 
 async function buildDomainGroups(realTabs = getRealTabs()) {
-  // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
+  // Landing pages (Gmail front page, Twitter home, etc.) get their own special group
   // so they can be closed together without affecting content tabs on the same domain.
+  // Gmail inbox/sent/search views count as content tabs, not landing pages.
   const LANDING_PAGE_PATTERNS = [
     { hostname: 'mail.google.com', test: (p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
+        !h.includes('#inbox') && !h.includes('#sent') && !h.includes('#search/') },
     { hostname: 'x.com',               pathExact: ['/home'] },
     { hostname: 'www.linkedin.com',    pathExact: ['/'] },
     { hostname: 'github.com',          pathExact: ['/'] },
@@ -3216,6 +5348,57 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
   }
 
   domainGroups = [];
+  // User-created Chrome tab groups render as first-class cards regardless of
+  // the sync toggle (the toggle only controls pushing domain mirror groups).
+  // Their tabs never fall into domain/landing grouping.
+  let userChromeGroups = [];
+  if (typeof queryUserChromeGroups === 'function') {
+    try {
+      const windowId = await getDashboardWindowIdForOpenTabs();
+      if (windowId != null) {
+        userChromeGroups = await queryUserChromeGroups(windowId);
+      } else {
+        console.warn('[tab-harbor] buildDomainGroups: no dashboard window id — skipping Chrome group cards');
+      }
+    } catch (err) {
+      console.warn('[tab-harbor] buildDomainGroups: Chrome group detection failed:', err);
+    }
+  }
+  // Distinguish "API failure" from "genuinely no groups": surface a throttled
+  // toast ONLY when the whole query failed (no groups came back at all). A
+  // single group's transient query failure must not misreport the entire
+  // result as unavailable — the snapshot fallback below still protects the
+  // affected tabs.
+  if (typeof getChromeGroupsLastError === 'function'
+      && getChromeGroupsLastError()
+      && (userChromeGroups || []).length === 0) {
+    const lastToastAt = window.__chromeGroupsErrorToastAt || 0;
+    if (Date.now() - lastToastAt > 15000) {
+      window.__chromeGroupsErrorToastAt = Date.now();
+      showToast(runtimeT ? runtimeT('toastChromeGroupsUnavailable') : 'Could not read Chrome tab groups');
+    }
+  }
+  const chromeOwnedTabIds = new Set((userChromeGroups || []).flatMap(g => g.tabIds || []));
+  // When queryUserChromeGroups failed or partially failed (C7), tabs that the
+  // openTabs snapshot already knows live in an UNMANAGED native Chrome group
+  // must never fall into domain or manual cards — otherwise syncChromeTabGroups
+  // could move them out of the user's real group into a dashboard mirror.
+  // Managed mirror groups are intentionally NOT treated as user-owned: their
+  // tabs belong to domain cards. The fallback is gated on the query failing:
+  // on a fully successful query the live tab list is authoritative, and a
+  // snapshot that lags behind a tab having LEFT a user group must not hide it
+  // from every card until the next fetch.
+  const chromeGroupsQueryFailed = typeof getChromeGroupsLastError === 'function' && Boolean(getChromeGroupsLastError());
+  if (chromeGroupsQueryFailed) {
+    const managedChromeGroupIds = typeof getManagedChromeGroupIds === 'function'
+      ? getManagedChromeGroupIds()
+      : new Set();
+    for (const tab of realTabs) {
+      if (Number.isInteger(tab?.groupId) && tab.groupId >= 0 && !managedChromeGroupIds.has(tab.groupId)) {
+        chromeOwnedTabIds.add(Number(tab.id));
+      }
+    }
+  }
   const manualGroupMap = Object.fromEntries(
     sessionGroupsState.groups.map(group => [
       group.id,
@@ -3250,6 +5433,8 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
   }
 
   for (const tab of realTabs) {
+    // A tab inside a user-created Chrome group belongs to that group's card.
+    if (chromeOwnedTabIds.has(tab.id)) continue;
     try {
       const assignedGroupId = sessionGroupsState.assignments[String(tab.id)];
       if (assignedGroupId && manualGroupMap[assignedGroupId]) {
@@ -3322,7 +5507,33 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
     }
   }
 
-  domainGroups = applyGroupOrder([...manualGroups, ...automaticGroups], groupOrderState);
+  // Chrome-group cards mirror the browser's tab strip: one card per
+  // user-created group, ordered by the group's first tab position.
+  // C12: the openTabs snapshot can lag (async/edge timing), so a tab id the
+  // snapshot has not materialized yet must not silently empty the card — keep
+  // a minimal placeholder so the card still renders and the next refresh
+  // fills the rows in.
+  const chromeCards = (userChromeGroups || [])
+    .map(group => ({
+      domain: `${CHROME_GROUP_PREFIX}${group.id}`,
+      label: group.title || 'Group',
+      tabs: (group.tabIds || []).map(id => {
+        const live = openTabs.find(t => Number(t.id) === Number(id));
+        return live || { id: Number(id), url: '', title: '', windowId: Number(group.windowId), groupId: Number(group.id) };
+      }),
+      isChromeGroup: true,
+      chromeGroupId: group.id,
+      chromeGroupColor: group.color,
+      chromeGroupCollapsed: group.collapsed,
+      chromePosition: group.minIndex,
+    }))
+    .filter(group => group.tabs.length > 0);
+
+  if (chromeCards.length > 0) {
+    domainGroups = [...chromeCards, ...applyGroupOrder([...manualGroups, ...automaticGroups], groupOrderState)];
+  } else {
+    domainGroups = applyGroupOrder([...manualGroups, ...automaticGroups], groupOrderState);
+  }
   await loadGroupTabOrder(domainGroups);
   return domainGroups;
 }
@@ -3336,10 +5547,7 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
     if (openTabsSectionCount) {
-      openTabsSectionCount.innerHTML = `
-        ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
-        <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
-        <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+      openTabsSectionCount.innerHTML = buildOpenTabsSectionActions();
     }
     if (openTabsMissionsEl) openTabsMissionsEl.innerHTML = `${renderTabSessionPicker()}${domainGroups.map(g => renderDomainCard(g)).join('')}`;
     syncWorkspaceTopNavMarkup(renderGroupNavArea(domainGroups), true);
@@ -3366,6 +5574,14 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
       }
     });
   }
+
+  // Re-apply the selection highlight and prune ids whose rows are gone; this
+  // also keeps the batch action bar in sync after any re-render. Expanded
+  // overflow state for cards that no longer exist is dropped.
+  for (const key of expandedPageChipGroupKeys) {
+    if (!domainGroups.some(group => String(group.domain) === key)) expandedPageChipGroupKeys.delete(key);
+  }
+  refreshPageChipSelectionClasses();
 }
 
 async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, patchDom = false, changedGroupKeys = [] } = {}) {
@@ -3375,6 +5591,7 @@ async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, 
   }
   if (patchDom) {
     patchOpenTabsDomFromGroups(realTabs, changedGroupKeys);
+    refreshPageChipSelectionClasses();
   } else {
     renderOpenTabsArea(realTabs);
   }
@@ -3397,7 +5614,7 @@ async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, 
  * 3. Groups tabs by domain (with landing pages pulled out to their own group)
  * 4. Renders domain cards
  * 5. Updates footer stats
- * 6. Renders the "Saved for Later" checklist
+ * 6. Renders the todos drawer (deferred column)
  */
 async function renderStaticDashboard() {
   // --- Header ---
@@ -3431,10 +5648,7 @@ async function renderStaticDashboard() {
   await buildDomainGroups(realTabs);
   renderOpenTabsArea(realTabs);
 
-  // --- Check for duplicate Tab Harbor tabs ---
-  checkTabOutDupes();
-
-  // --- Render "Saved for Later" column ---
+  // --- Render the todos drawer (deferred column) ---
   await renderDeferredColumn();
   
   // Setup image error handlers for CSP compliance
@@ -3484,8 +5698,7 @@ async function collapseChromeGroupsForCurrentTabHarborTab() {
 
   const currentTab = await resolveCurrentDashboardTab();
 
-  const newtabUrl = window.location.href;
-  const isTabHarborTab = currentTab?.url === newtabUrl || currentTab?.url === 'chrome://newtab/';
+  const isTabHarborTab = isTabHarborNewTabUrl(currentTab?.url);
   if (!currentTab?.windowId || !isTabHarborTab) return;
   await collapseChromeTabGroupsInWindow(currentTab.windowId);
 }
@@ -3507,7 +5720,30 @@ function updateBackToTopVisibility() {
    ---------------------------------------------------------------- */
 
 document.addEventListener('click', async (e) => {
-  if (e.target.closest('.chip-reorder-handle')) return;
+  // Clicking outside the tab cards (and the batch action bar) clears the
+  // highlight-only selection.
+  if (selectedPageChipIds.size > 0 && !e.target.closest('.mission-card') && !e.target.closest('#pageChipBatchBar')) {
+    clearPageChipSelection();
+  }
+  if (e.target.closest('.chip-reorder-handle')) {
+    // Keyboard activation (Enter/Space) toggles the row in the selection;
+    // pointer clicks are already handled by the pointerup path.
+    if (e.detail === 0 && !(draggedPageChipId && pageChipDragState)) {
+      const chip = e.target.closest('[data-chip-sort-id]');
+      if (chip) {
+        const key = String(chip.dataset.chipSortId || '');
+        // A touch/pen tap already toggled this row in the pointerup path — the
+        // synthesized click must not toggle it a second time. Keyboard clicks
+        // are preceded by a keydown, so they never hit this guard.
+        if (pageChipPointerToggleGuard.key === key
+          && Date.now() < pageChipPointerToggleGuard.until
+          && Date.now() - pageChipLastKeydownAt > 120) return;
+        if (e.shiftKey && pageChipSelectionAnchorId) selectPageChipRange(key, pageChipSelectionAnchorId);
+        else togglePageChipSelection(key);
+      }
+    }
+    return;
+  }
   // Walk up the DOM to find the nearest element with data-action
   const actionEl = e.target.closest('[data-action]');
   if (!actionEl) return;
@@ -3546,6 +5782,34 @@ document.addEventListener('click', async (e) => {
       ? runtimeT(modeLabelKey)
       : mode;
     showToast(runtimeT ? runtimeT('toastThemeModeUpdated', { mode: modeLabel }) : `Appearance mode: ${modeLabel}`);
+    return;
+  }
+
+  if (action === 'select-quick-shortcut-cols') {
+    const cols = ['auto', '4', '5'].includes(actionEl.dataset.cols) ? actionEl.dataset.cols : 'auto';
+    await saveThemePreferences({ quickShortcutCols: cols });
+    // renderThemeMenu does not know about this choice row, so patch it in place.
+    document.querySelectorAll('[data-action="select-quick-shortcut-cols"]').forEach(option => {
+      const isActive = option.dataset.cols === cols;
+      option.classList.toggle('is-active', isActive);
+      option.setAttribute('aria-pressed', String(isActive));
+    });
+    setThemeMenuOpen(false, { restoreFocus: true });
+    return;
+  }
+
+  if (action === 'select-search-engine') {
+    const engine = ['default', 'google', 'bing', 'baidu', 'sogou', 'duckduckgo', 'brave', 'yandex', 'custom'].includes(actionEl.dataset.engine) ? actionEl.dataset.engine : 'default';
+    await saveThemePreferences({ searchEngine: engine });
+    syncSearchPlaceholder();
+    // renderThemeMenu does not know about this choice row, so patch it in place.
+    document.querySelectorAll('[data-action="select-search-engine"]').forEach(option => {
+      const isActive = option.dataset.engine === engine;
+      option.classList.toggle('is-active', isActive);
+      option.setAttribute('aria-pressed', String(isActive));
+    });
+    const customSection = document.getElementById('customSearchUrlSection');
+    if (customSection) customSection.style.display = engine === 'custom' ? '' : 'none';
     return;
   }
 
@@ -3655,6 +5919,34 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  if (action === 'toggle-auto-focus-search') {
+    const nextEnabled = !(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled);
+    await saveThemePreferences({ autoFocusSearchEnabled: nextEnabled });
+    // Mirror the toggle into localStorage so focus-redirect.js (the first
+    // <head> script, which runs before chrome.storage is readable) can decide
+    // synchronously whether to self-navigate. '0' = off.
+    try {
+      localStorage.setItem('tabHarborAutoFocusSearch', nextEnabled ? '1' : '0');
+    } catch { /* ignore */ }
+    const toggleSwitch = document.querySelector('[data-action="toggle-auto-focus-search"]');
+    if (toggleSwitch) {
+      toggleSwitch.classList.toggle('is-active', nextEnabled);
+      toggleSwitch.setAttribute('aria-pressed', String(nextEnabled));
+    }
+    return;
+  }
+
+  if (action === 'toggle-quick-shortcut-open-mode') {
+    const nextMode = (typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'new-tab' : 'current-tab';
+    await saveThemePreferences({ quickShortcutOpenMode: nextMode });
+    const toggleSwitch = document.querySelector('[data-action="toggle-quick-shortcut-open-mode"]');
+    if (toggleSwitch) {
+      toggleSwitch.classList.toggle('is-active', nextMode === 'current-tab');
+      toggleSwitch.setAttribute('aria-pressed', String(nextMode === 'current-tab'));
+    }
+    return;
+  }
+
   const card = actionEl.closest('.mission-card');
 
   if (action === 'save-current-window-session') {
@@ -3737,10 +6029,18 @@ document.addEventListener('click', async (e) => {
 
   // ---- Expand overflow chips ("+N more") ----
   if (action === 'expand-chips') {
-    const overflowContainer = actionEl.parentElement.querySelector('.page-chips-overflow');
-    if (overflowContainer) {
-      overflowContainer.style.display = 'contents';
-      actionEl.remove();
+    const cardEl = actionEl.closest('.mission-card');
+    const collapsed = cardEl ? [...cardEl.querySelectorAll('.page-chip--collapsed')] : [];
+    collapsed.forEach(chip => chip.classList.remove('page-chip--collapsed'));
+    actionEl.remove();
+    // Remember the expansion so drag commits and refreshes keep it open.
+    const groupKey = String(cardEl?.dataset?.groupId || '');
+    if (groupKey) expandedPageChipGroupKeys.add(groupKey);
+    // Keyboard activation should hand focus to the newly revealed rows
+    // instead of dropping it to the page body.
+    if (e.detail === 0) {
+      const firstHandle = collapsed[0]?.querySelector('[data-chip-drag-handle="tab"]');
+      if (firstHandle) firstHandle.focus();
     }
     return;
   }
@@ -3748,6 +6048,28 @@ document.addEventListener('click', async (e) => {
   // ---- Focus a specific tab ----
   if (action === 'focus-tab') {
     if (Date.now() < suppressPageChipClickUntil) return;
+    const chip = actionEl.closest('[data-chip-sort-id]');
+    const key = chip ? String(chip.dataset.chipSortId || '') : '';
+    // The pointerup path already handled this gesture as a click (a toggle);
+    // the click that follows must not toggle the row again — or jump to the
+    // tab the user just deselected. Row bodies are not keyboard-focusable, so
+    // no keydown bypass is needed here (unlike the handle branch above).
+    const toggleGuardHit = Boolean(key)
+      && pageChipPointerToggleGuard.key === key
+      && Date.now() < pageChipPointerToggleGuard.until;
+    if (toggleGuardHit) return;
+    // While a multi-selection exists, clicking a row toggles it in the
+    // selection instead of activating the tab — batch mode never jumps.
+    if (selectedPageChipIds.size > 0) {
+      if (key) {
+        if (e.shiftKey && pageChipSelectionAnchorId) {
+          selectPageChipRange(key, pageChipSelectionAnchorId);
+        } else {
+          togglePageChipSelection(key);
+        }
+      }
+      return;
+    }
     const tabUrl = actionEl.dataset.tabUrl;
     const tabId = actionEl.dataset.tabId || '';
     if (tabUrl || tabId) await focusTab(tabUrl, tabId);
@@ -3777,14 +6099,13 @@ document.addEventListener('click', async (e) => {
     const tabId = actionEl.dataset.tabId || '';
     if (!tabUrl && !tabId) return;
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-
     // Close the tab in Chrome directly. Prefer id so suspended/canonical URLs
     // and duplicate pages cannot close the wrong tab.
-    await removeOpenTabByIdOrUrl(tabId, tabUrl);
-    await fetchOpenTabs();
-    await loadSessionGroups(getOpenTabIdsForSessionPruning());
+    await runWithSuppressedRefresh(async () => {
+      await removeOpenTabByIdOrUrl(tabId, tabUrl);
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
+    });
 
     playCloseSound();
 
@@ -3845,8 +6166,29 @@ document.addEventListener('click', async (e) => {
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const discarded = await discardTab(Number(tabId));
-    if (!discarded) {
+    // A chip can outlive its tab when the tab is replaced/closed without a
+    // refresh (e.g. an OAuth/redirect flow swaps the tab id). Sleeping a ghost
+    // id would silently no-op, and the re-render would then drop the dangling
+    // manual-group assignment — making the card structure look wrong. Detect it
+    // up front: re-render to drop the ghost row, and let the refresh prune any
+    // dangling assignment.
+    const { discarded, failed, stale } = await sleepTabsByIds([tabId], { skipActive: false });
+    if (stale > 0) {
+      // The chip outlived its tab: prune the dangling assignment right away
+      // (same as the success branch) so the re-render drops both the ghost
+      // row and its stale manual-group entry, even if the background refresh
+      // message is suppressed by the window below.
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
+      await renderDashboard();
+      updateBackToTopVisibility();
+      window.__suppressAutoRefreshUntil = 0;
+      showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') || 'Tab already closed' : 'Tab already closed');
+      return;
+    }
+
+    if (failed > 0 || discarded === 0) {
+      window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tab' : 'Failed to sleep tab');
       return;
     }
@@ -3854,6 +6196,8 @@ document.addEventListener('click', async (e) => {
     await fetchOpenTabs();
     await loadSessionGroups(getOpenTabIdsForSessionPruning());
     await renderDashboard();
+    updateBackToTopVisibility();
+    window.__suppressAutoRefreshUntil = 0;
 
     showToast(runtimeT ? runtimeT('toastTabDiscarded') : 'Tab sleeping');
     return;
@@ -3865,58 +6209,255 @@ document.addEventListener('click', async (e) => {
     const tabId = actionEl.dataset.tabId || '';
     if (!tabId) return;
 
-    await openTabSessionPicker({
-      source: 'single-tab',
-      initialTabIds: [tabId],
-      scopeTabIds: [tabId],
-    });
+    await openSessionPickerForTabs([tabId], 'single-tab');
+    return;
+  }
+
+  // ---- Batch actions for the handle multi-selection ----
+  if (action === 'batch-close-tabs') {
+    e.stopPropagation();
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      const tabIds = getSelectedBatchTabIds();
+      const { closedCount } = await closeTabsSafely(tabIds);
+      await finishBatchAction({ clearSelection: true });
+      showToast(runtimeT ? runtimeT('toastBatchClosed', { count: closedCount }) : `${closedCount} tabs closed`);
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
+    }
+  }
+
+  if (action === 'batch-discard-tabs') {
+    e.stopPropagation();
+    if (!sleepControlEnabled) return;
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      // Resolve each selected chip to its live tab id through the current DOM,
+      // then keep the ORIGINAL chip sort ids for every tab that survives. This
+      // preserves selection across all cards even when a chip sort id is not a
+      // plain tab id (e.g. URL-based tokens or placeholder rows).
+      const chipTabIds = getPageChipTabIdMap();
+      const tabIds = [...selectedPageChipIds]
+        .map(chipId => chipTabIds.get(String(chipId)))
+        .filter(tabId => tabId != null);
+      const { discarded, failed, skippedActive, stale, resultsByTabId } = await sleepTabsByIds(tabIds, { skipActive: true });
+      // Chips that could not be resolved to a numeric tab id did not take
+      // part in the sleep, so they were not affected — keep them selected.
+      // Chips whose tab was processed stay selected when the tab survived
+      // (stale/failed/skipped-active included); rows that are really gone
+      // are pruned by refreshPageChipSelectionClasses after the render.
+      const keptChipIds = [...selectedPageChipIds].filter(chipId => {
+        const tabId = chipTabIds.get(String(chipId));
+        return tabId == null || resultsByTabId.has(tabId);
+      });
+      await finishBatchAction({ keptChipIds });
+      if (discarded > 0) {
+        showToast(runtimeT ? runtimeT('toastTabsDiscarded', { count: discarded }) : `${discarded} tabs sleeping`);
+      } else if (failed > 0) {
+        showToast(runtimeT ? runtimeT('toastTabDiscardFailed') : 'Failed to sleep tab');
+      } else if (skippedActive > 0) {
+        showToast(runtimeT ? runtimeT('toastBatchSleepNone') : 'Selected tabs are active');
+      } else if (stale > 0) {
+        showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') : 'Tab already closed');
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
+    }
+  }
+
+  // ---- Deduplicate within the selection, keep one copy per URL ----
+  if (action === 'batch-dedup-selection') {
+    e.stopPropagation();
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      const chipTabIds = getPageChipTabIdMap();
+      const tabIds = getSelectedBatchTabIds();
+      const { closedCount, closedTabIds } = await closeDuplicatesInSelection(tabIds);
+      // Keep the ORIGINAL chip sort ids that survive dedup, so selection is
+      // preserved on every card even when a chip id is not a plain tab id.
+      // Chips without a resolvable numeric tab id did not take part in the
+      // dedup — keep them selected. refreshPageChipSelectionClasses prunes
+      // any id that no longer has a row.
+      const keptChipIds = [...selectedPageChipIds].filter(chipId => {
+        const tabId = chipTabIds.get(String(chipId));
+        return tabId == null || !closedTabIds.has(tabId);
+      });
+      await finishBatchAction({ keptChipIds });
+      if (closedCount > 0) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchClosedDuplicates', { count: closedCount })
+          : `Closed ${closedCount} duplicate tabs`);
+      } else {
+        showToast(runtimeT ? runtimeT('toastBatchNoDuplicates') : 'No duplicate tabs in selection');
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
+    }
+  }
+
+  if (action === 'batch-save-session') {
+    e.stopPropagation();
+    const tabIds = getSelectedBatchTabIds().map(String);
+    if (!tabIds.length) return;
+    await openSessionPickerForTabs(tabIds, 'selected');
+    return;
+  }
+
+  // ---- Merge the whole selection into ONE new Chrome tab group ----
+  if (action === 'batch-merge-chrome-group') {
+    e.stopPropagation();
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      // Skip pinned tabs (Chrome cannot group them). Tabs already inside a
+      // Chrome group ARE merged: chrome.tabs.group without a groupId moves them
+      // out of their source group and into the newly created group.
+      const pinnedIds = new Set((openTabs || []).filter(t => t?.pinned).map(t => Number(t.id)));
+      const allSelected = getSelectedBatchTabIds();
+      const tabIds = allSelected.filter(id => !pinnedIds.has(id));
+      const skippedCount = allSelected.length - tabIds.length;
+      if (!tabIds.length) {
+        showToast(runtimeT ? runtimeT('toastBatchMergeNoEligible') : 'No eligible tabs to merge');
+        return;
+      }
+      beginBatchAction();
+
+      let mergeResult;
+      try {
+        // Resolve the name from the ACTUAL merged ids: stale ids dropped by
+        // groupTabsWithStaleRetry must not drive the group name.
+        const title = (mergedIds) => buildBatchMergeGroupTitle(mergedIds);
+        const color = typeof runtimeAssignGroupColor === 'function'
+          ? runtimeAssignGroupColor('all', chromeGroupMergeColorIndex++)
+          : 'blue';
+        mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title, color });
+      } catch (err) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+        return;
+      }
+
+      // Tabs moving into a native group drop their dashboard manual-group
+      // assignments (same cleanup as the drag-into-Chrome-group path). The
+      // group side effect has already happened, so a storage failure must not
+      // leave the selection/suppression dangling (C6/C22).
+      const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
+      try {
+        let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
+        nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+        await saveSessionGroups(nextState);
+      } catch (err) {
+        console.warn('[tab-harbor] batch merge: session cleanup failed after group creation:', err);
+        await finishBatchAction({ clearSelection: true });
+        showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+        return;
+      }
+
+      await finishBatchAction({ clearSelection: true });
+      if (!mergeResult.updated) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
+      } else if (skippedCount > 0) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedChromeGroupWithSkipped', { count: mergedTabIds.length, skipped: skippedCount })
+          : `Merged ${mergedTabIds.length} tabs into a Chrome tab group (${skippedCount} skipped)`);
+      } else {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedChromeGroup', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs into a Chrome tab group`);
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
+    }
+  }
+
+  if (action === 'clear-chip-selection') {
+    e.stopPropagation();
+    clearPageChipSelection();
     return;
   }
 
   // ---- Close all tabs in a domain group ----
   if (action === 'close-domain-tabs') {
-    const domainId = actionEl.dataset.domainId;
-    const group    = domainGroups.find(g => {
-      return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
-    });
-    if (!group) return;
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      const domainId = actionEl.dataset.domainId;
+      const group    = domainGroups.find(g => {
+        return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
+      });
+      if (!group) return;
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const urls      = group.tabs.map(t => t.url);
-    // Landing pages and custom groups (whose domain key isn't a real hostname)
-    // must use exact URL matching to avoid closing unrelated tabs
-    const useExact  = group.domain === '__landing-pages__' || !!group.label;
+      const urls      = group.tabs.map(t => t.url);
+      // Landing pages and custom groups (whose domain key isn't a real hostname)
+      // must use exact URL matching to avoid closing unrelated tabs. Chrome-group
+      // cards are scoped by their own tab ids: URL matching would close same-URL
+      // tabs outside the group (C12).
+      const useExact  = group.domain === '__landing-pages__' || !!group.label;
 
-    if (useExact) {
-      await closeTabsExact(urls);
-    } else {
-      await closeTabsByUrls(urls);
+      // Start the card exit immediately so the close feels instant; the tabs
+      // close in the background below (the suppressed refresh syncs the rest).
+      if (card) {
+        playCloseSound();
+        animateCardOut(card);
+      }
+
+      // Remove from in-memory groups
+      const idx = domainGroups.indexOf(group);
+      if (idx !== -1) domainGroups.splice(idx, 1);
+
+      // Close the tabs in the background (the card is already exiting), then
+      // rebuild so the nav and remaining cards reflect the closed group.
+      let closeResult = { closedCount: 0 };
+      try {
+        if (group.isChromeGroup) {
+          const tabIds = group.tabs.map(t => Number(t.id)).filter(Number.isFinite);
+          closeResult = await closeTabsSafely(tabIds, { playSound: false });
+        } else {
+          closeResult = await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
+        }
+      } catch { /* swallow: tabs may already be gone */ }
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      const closedCount = closeResult.closedCount;
+      const groupLabel = group.domain === '__landing-pages__'
+        ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
+        : (group.label || friendlyDomain(group.domain));
+      const tabsWord = runtimeT
+        ? (closedCount === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
+        : `tab${closedCount !== 1 ? 's' : ''}`;
+      showToast(runtimeT
+        ? runtimeT('closedTabsFromGroup', { count: closedCount, tabsWord, groupLabel })
+        : `Closed ${closedCount} ${tabsWord} from ${groupLabel}`);
+
+      const statTabs = document.getElementById('statTabs');
+      if (statTabs) statTabs.textContent = openTabs.length;
+      return;
+    } finally {
+      // A rejected close/query/render must not strand the event-driven tab
+      // refresh behind a stale suppression deadline.
+      window.__suppressAutoRefreshUntil = 0;
+      cardActionInFlight = false;
     }
-
-    if (card) {
-      playCloseSound();
-      animateCardOut(card);
-    }
-
-    // Remove from in-memory groups
-    const idx = domainGroups.indexOf(group);
-    if (idx !== -1) domainGroups.splice(idx, 1);
-
-    const groupLabel = group.domain === '__landing-pages__'
-      ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
-      : (group.label || friendlyDomain(group.domain));
-    const tabsWord = runtimeT
-      ? (urls.length === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
-      : `tab${urls.length !== 1 ? 's' : ''}`;
-    showToast(runtimeT
-      ? runtimeT('closedTabsFromGroup', { count: urls.length, tabsWord, groupLabel })
-      : `Closed ${urls.length} ${tabsWord} from ${groupLabel}`);
-
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
-    return;
   }
 
   // ---- Save a whole domain group as one session snapshot (then close it) ----
@@ -3931,52 +6472,60 @@ document.addEventListener('click', async (e) => {
       .filter(Boolean);
     if (!tabIds.length) return;
 
-    await openTabSessionPicker({
-      source: 'group',
-      initialTabIds: tabIds,
-      scopeTabIds: tabIds,
-    });
+    await openSessionPickerForTabs(tabIds, 'group');
     return;
   }
 
   // ---- Sleep all tabs in a domain group ----
   if (action === 'sleep-domain-tabs') {
-    const domainId = actionEl.dataset.domainId || '';
-    const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
-    if (!group) return;
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      const domainId = actionEl.dataset.domainId || '';
+      const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+      if (!group) return;
 
-    const tabs = getOrderedUniqueTabsForGroup(group).filter(t => !t.active);
-    if (!tabs.length) return;
+      // Already-discarded rows have no sleep button and cannot be discarded
+      // again; filter them out so "nothing left to sleep" is a silent no-op
+      // instead of a misleading failure toast.
+      const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active && !t.discarded).map(t => t.id);
+      if (!tabIds.length) return;
 
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const results = await Promise.all(tabs.map(t => discardTab(t.id)));
-    const succeeded = results.filter(Boolean).length;
-    if (!succeeded) {
-      showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
+      const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
+      if (discarded === 0) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
+        return;
+      }
+
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      showToast(runtimeT
+        ? runtimeT('toastTabsDiscarded', { count: discarded })
+        : `${discarded} tabs sleeping`);
       return;
+    } finally {
+      cardActionInFlight = false;
     }
-
-    await fetchOpenTabs();
-    await loadSessionGroups(getOpenTabIdsForSessionPruning());
-    await renderDashboard();
-
-    showToast(runtimeT
-      ? runtimeT('toastTabsDiscarded', { count: succeeded })
-      : `${succeeded} tabs sleeping`);
-    return;
   }
 
   // ---- Sleep all open tabs ----
   if (action === 'sleep-all-open-tabs') {
-    const allTabs = getRealTabs().filter(t => !t.active);
-    if (!allTabs.length) return;
+    // Same as the per-group path: already-discarded tabs are not sleepable
+    // again, so an all-slept window is a silent no-op, not a false failure.
+    const tabIds = getRealTabs().filter(t => !t.active && !t.discarded).map(t => t.id);
+    if (!tabIds.length) return;
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const results = await Promise.all(allTabs.map(t => discardTab(t.id)));
-    const succeeded = results.filter(Boolean).length;
-    if (!succeeded) {
+    const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
+    if (discarded === 0) {
+      window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
       return;
     }
@@ -3984,70 +6533,205 @@ document.addEventListener('click', async (e) => {
     await fetchOpenTabs();
     await loadSessionGroups(getOpenTabIdsForSessionPruning());
     await renderDashboard();
+    window.__suppressAutoRefreshUntil = 0;
 
     showToast(runtimeT
-      ? runtimeT('toastTabsDiscarded', { count: succeeded })
-      : `${succeeded} tabs sleeping`);
+      ? runtimeT('toastTabsDiscarded', { count: discarded })
+      : `${discarded} tabs sleeping`);
     return;
+  }
+
+  // ---- Merge tabs into one Chrome tab group ----
+  if (action === 'group-card-tabs') {
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      const scope = actionEl.dataset.scope || '';
+      const domainId = actionEl.dataset.domainId || '';
+      const group = scope === 'all' ? null : domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+      if (scope !== 'all' && !group) return;
+
+      const tabIds = [];
+      if (scope === 'all') {
+        // Section-header variant: merge every open tab (all cards) into one
+        // Chrome tab group. Pinned tabs and existing Chrome-group cards stay
+        // outside the merged group.
+        for (const g of domainGroups) {
+          if (g.isChromeGroup) continue;
+          for (const tab of getOrderedUniqueTabsForGroup(g)) {
+            const id = Number(tab?.id);
+            if (!Number.isInteger(id) || id <= 0) continue;
+            if (tab?.pinned) continue;
+            tabIds.push(id);
+          }
+        }
+      } else if (group) {
+        // Per-domain merge: pinned tabs stay outside the merged Chrome group,
+        // matching the section-header merge-all path (Chrome cannot group them).
+        for (const tab of getOrderedUniqueTabsForGroup(group)) {
+          const id = Number(tab?.id);
+          if (!Number.isInteger(id) || id <= 0) continue;
+          if (tab?.pinned) continue;
+          tabIds.push(id);
+        }
+      }
+      if (!tabIds.length) return;
+
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      // The dashboard's own group write must not echo through the event
+      // subscription (same mute contract as every other group write path).
+      if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+
+      let mergeResult;
+      try {
+        // The merge-all label is count-based: resolve it from the ACTUAL merged
+        // ids so stale ids dropped by groupTabsWithStaleRetry cannot inflate the
+        // count in the group title.
+        const label = scope === 'all'
+          ? (mergedIds) => (runtimeT ? runtimeT('mergeAllGroupTitle', { count: mergedIds.length }) : `Open tabs (${mergedIds.length})`)
+          : getGroupDisplayLabel(group);
+        // Merged groups rotate through the accent palette (not always grey):
+        // both the section-header merge-all and the per-domain merge use the
+        // same shared counter so consecutive merges get different colors.
+        const color = typeof runtimeAssignGroupColor === 'function'
+          ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, chromeGroupMergeColorIndex++)
+          : 'blue';
+        mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
+      } catch (err) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+        return;
+      }
+
+      // Tabs moving into a native group drop their dashboard manual-group
+      // assignments, matching the batch-merge and drag-into-Chrome-group paths
+      // (C2). Use the actual merged ids so stale tabs are not carried forward.
+      const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
+      let cleanupFailed = false;
+      try {
+        let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
+        nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+        await saveSessionGroups(nextState);
+      } catch (err) {
+        cleanupFailed = true;
+        console.warn('[tab-harbor] group-card merge: session cleanup failed:', err);
+      }
+
+      // The merge consumes the selection (matching the batch-merge path, which
+      // calls finishBatchAction({ clearSelection: true })): without this the
+      // handle multi-selection would keep highlighting rows that now live in
+      // the native group.
+      clearPageChipSelection();
+
+      // Rebuild so the card reflects the new native group right away.
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      if (cleanupFailed) {
+        showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+      } else if (mergeResult.updated) {
+        showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
+      } else {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
+      }
+      return;
+    } finally {
+      cardActionInFlight = false;
+    }
   }
 
   // ---- Close duplicates, keep one copy ----
   if (action === 'dedup-keep-one') {
-    const urlsEncoded = actionEl.dataset.dupeUrls || '';
-    const urls = urlsEncoded.split(',').map(u => decodeURIComponent(u)).filter(Boolean);
-    if (urls.length === 0) return;
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      // Chrome-group cards dedup within their own tab set only; URL-wide
+      // matching would close same-URL tabs outside the group (C12).
+      const chromeCard = actionEl.closest('.mission-card.chrome-group-card');
+      const chromeGroupId = chromeCard?.dataset?.chromeGroupId;
+      const chromeGroup = chromeGroupId
+        ? domainGroups.find(g => g.isChromeGroup && String(g.chromeGroupId) === String(chromeGroupId))
+        : null;
+      const urlsEncoded = actionEl.dataset.dupeUrls || '';
+      const urls = urlsEncoded.split(',').map(u => decodeURIComponent(u)).filter(Boolean);
+      const chromeTabIds = chromeGroup
+        ? chromeGroup.tabs.map(t => Number(t.id)).filter(Number.isFinite)
+        : [];
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      // No-op selections must return BEFORE the refresh-suppression window is
+      // raised: an early return can never leak a 2s auto-refresh block.
+      if (chromeGroup ? chromeTabIds.length === 0 : urls.length === 0) return;
 
-    await closeDuplicateTabs(urls, true);
-    playCloseSound();
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    // Hide the dedup button
-    actionEl.style.transition = 'opacity 0.2s';
-    actionEl.style.opacity    = '0';
-    setTimeout(() => actionEl.remove(), 200);
+      const closeResult = chromeGroup
+        ? await closeDuplicatesInSelection(chromeTabIds, { playSound: false })
+        : await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+      if (closeResult.closedCount > 0) {
+        playCloseSound();
+      }
 
-    // Remove dupe badges from the card
-    if (card) {
-      card.querySelectorAll('.chip-dupe-badge').forEach(b => {
-        b.style.transition = 'opacity 0.2s';
-        b.style.opacity    = '0';
-        setTimeout(() => b.remove(), 200);
-      });
-      card.querySelectorAll('.duplicate-count-badge').forEach(badge => {
-        badge.style.transition = 'opacity 0.2s';
-        badge.style.opacity    = '0';
-        setTimeout(() => badge.remove(), 200);
-      });
-      card.classList.remove('has-amber-bar');
-      card.classList.add('has-neutral-bar');
+      // Rebuild the open-tabs area right away so the kept copy shows
+      // immediately. The suppression above deliberately drops the event-driven
+      // refresh, so without this call the stale duplicate chips would stay
+      // visible until the next unsuppressed tab event (~2s later).
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      showToast(closeResult.closedCount > 0
+        ? (runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each')
+        : (runtimeT ? runtimeT('toastNoDuplicatesClosed') : 'No duplicate tabs were closed'));
+      return;
+    } finally {
+      // The close operation or the immediate re-render can reject. Always
+      // release refresh suppression before allowing another card action.
+      window.__suppressAutoRefreshUntil = 0;
+      cardActionInFlight = false;
     }
-
-    showToast(runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each');
-    return;
   }
 
   // ---- Close ALL open tabs ----
   if (action === 'close-all-open-tabs') {
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-    
-    const allUrls = openTabs
-      .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
-      .map(t => t.url);
-    await closeTabsByUrls(allUrls);
-    playCloseSound();
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      await runWithSuppressedRefresh(async () => {
+        const allUrls = openTabs
+          .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
+          .map(t => t.url);
+        const closeResult = await closeTabsByUrlsSafely(allUrls, { playSound: false });
+        await refreshTabData();
+        const remainingCount = getRealTabs().length;
+        if (closeResult.closedCount > 0) playCloseSound();
 
-    document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
-      shootConfetti(
-        c.getBoundingClientRect().left + c.offsetWidth / 2,
-        c.getBoundingClientRect().top  + c.offsetHeight / 2
-      );
-      animateCardOut(c);
-    });
+        if (remainingCount === 0) {
+          document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
+            shootConfetti(
+              c.getBoundingClientRect().left + c.offsetWidth / 2,
+              c.getBoundingClientRect().top  + c.offsetHeight / 2
+            );
+            animateCardOut(c);
+          });
+        } else {
+          await renderDashboard();
+        }
 
-    showToast(runtimeT ? runtimeT('toastAllTabsClosed') : 'All tabs closed. Fresh start.');
+        showToast(remainingCount === 0
+          ? (runtimeT ? runtimeT('toastAllTabsClosed') : 'All tabs closed. Fresh start.')
+          : (runtimeT
+            ? runtimeT('toastTabsClosedWithRemaining', { closedCount: closeResult.closedCount, remainingCount })
+            : `Closed ${closeResult.closedCount} tabs; ${remainingCount} remain open`));
+      });
+    } catch (error) {
+      console.warn('[tab-harbor] Could not close all tabs:', error);
+      showToast(runtimeT ? runtimeT('toastTabsCloseFailed') : 'Could not close tabs');
+    } finally {
+      cardActionInFlight = false;
+    }
     return;
   }
 });
@@ -4166,6 +6850,200 @@ document.addEventListener('click', (e) => {
   });
 });
 
+// @lat: [[features#Tab row multi-select and batch drag]]
+/**
+ * togglePageChipSelection(chipId)
+ *
+ * Handle-click toggles a row into the highlight-only selection. Selected
+ * rows reorder together when one of them is dragged within its group.
+ */
+function togglePageChipSelection(chipId) {
+  const key = String(chipId || '');
+  if (!key) return;
+  if (selectedPageChipIds.has(key)) selectedPageChipIds.delete(key);
+  else selectedPageChipIds.add(key);
+  pageChipSelectionAnchorId = key;
+  refreshPageChipSelectionClasses();
+}
+
+function refreshPageChipSelectionClasses() {
+  const seen = new Set();
+  document.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
+    const id = String(row.dataset.chipSortId || '');
+    seen.add(id);
+    const selected = selectedPageChipIds.has(id);
+    row.classList.toggle('is-selected', selected);
+    const handle = row.querySelector('[data-chip-drag-handle="tab"]');
+    if (handle) handle.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+  // Prune ids whose rows are gone (closed tabs) so stale selections cannot
+  // linger, inflate the batch count, or highlight an unrelated tab later.
+  for (const id of selectedPageChipIds) {
+    if (!seen.has(id)) {
+      selectedPageChipIds.delete(id);
+      if (pageChipSelectionAnchorId === id) pageChipSelectionAnchorId = '';
+    }
+  }
+  syncPageChipBatchBar();
+}
+
+function clearPageChipSelection() {
+  selectedPageChipIds.clear();
+  pageChipSelectionAnchorId = '';
+  refreshPageChipSelectionClasses();
+}
+
+/**
+ * selectPageChipRange(targetId, anchorId)
+ *
+ * Shift+click / Shift+Space selects every row between the anchor (last toggled
+ * row) and the target within the same card, inclusive. Cross-card targets fall
+ * back to a plain toggle.
+ */
+function selectPageChipRange(targetId, anchorId) {
+  const targetKey = String(targetId || '');
+  const anchorKey = String(anchorId || '');
+  if (!targetKey) return;
+  const targetEl = document.querySelector(`.page-chip[data-chip-sort-id="${CSS.escape(targetKey)}"]`);
+  const anchorEl = anchorKey ? document.querySelector(`.page-chip[data-chip-sort-id="${CSS.escape(anchorKey)}"]`) : null;
+  if (!targetEl) return;
+  if (!anchorEl || targetEl.closest('.mission-card') !== anchorEl.closest('.mission-card')) {
+    togglePageChipSelection(targetKey);
+    return;
+  }
+  const card = targetEl.closest('.mission-card');
+  // Collapsed overflow rows are not part of the visible range.
+  const rows = [...card.querySelectorAll('.page-chip[data-chip-sort-id]:not(.page-chip--collapsed)')];
+  const start = rows.indexOf(anchorEl);
+  const end = rows.indexOf(targetEl);
+  if (start === -1 || end === -1) {
+    togglePageChipSelection(targetKey);
+    return;
+  }
+  const lo = Math.min(start, end);
+  const hi = Math.max(start, end);
+  for (let i = lo; i <= hi; i += 1) {
+    selectedPageChipIds.add(String(rows[i].dataset.chipSortId));
+  }
+  pageChipSelectionAnchorId = targetKey;
+  refreshPageChipSelectionClasses();
+}
+
+/**
+ * buildBatchMergeGroupTitle(tabIds)
+ *
+ * Names a new Chrome tab group from the SELECTED tabs' content: the most
+ * frequent domain wins (single-domain selections use the bare site name, e.g.
+ * "GitHub"; mixed selections append the count, e.g. "GitHub ×3"), falling back
+ * to the first tab's title when no domain is resolvable, then to the generic
+ * "Selected (N)" label. Chrome exposes no content-aware naming API, so the
+ * heuristic runs locally.
+ */
+function buildBatchMergeGroupTitle(tabIds) {
+  // Keep common brand names in their canonical casing; friendlyDomain would
+  // otherwise turn "github.com" into "Github".
+  const BRAND_DOMAIN_LABELS = {
+    'github.com': 'GitHub',
+    'youtube.com': 'YouTube',
+  };
+  const tabs = getTabsByIds(tabIds);
+  const counts = new Map();
+  for (const tab of tabs) {
+    const rawUrl = String(tab?.url || '');
+    // Internal pages (chrome://, about:) never drive the group name.
+    if (/^(chrome|about|edge|brave|opera):/i.test(rawUrl)) continue;
+    let hostname = '';
+    try { hostname = new URL(rawUrl).hostname || ''; } catch { hostname = ''; }
+    if (!hostname) continue;
+    hostname = hostname.replace(/^www\./, '');
+    if (!hostname) continue;
+    counts.set(hostname, (counts.get(hostname) || 0) + 1);
+  }
+  if (counts.size > 0) {
+    let topDomain = '';
+    let topCount = 0;
+    for (const [domain, count] of counts) {
+      if (count > topCount) {
+        topDomain = domain;
+        topCount = count;
+      }
+    }
+    const label = BRAND_DOMAIN_LABELS[topDomain] || friendlyDomain(topDomain) || topDomain || 'Group';
+    return counts.size === 1 ? label : `${label} ×${topCount}`;
+  }
+  const firstTitle = tabs.find(t => t?.title)?.title;
+  if (firstTitle) return firstTitle.trim().slice(0, 40) || 'Group';
+  return runtimeT ? runtimeT('batchMergeGroupTitle', { count: tabIds.length }) : `Selected (${tabIds.length})`;
+}
+
+/**
+ * syncPageChipBatchBar()
+ *
+ * While a multi-selection exists, the open-tabs section header transforms in
+ * place: the title becomes the selection count and the header's icon actions
+ * are replaced by the batch action bar (clear / dedup / merge / sleep / save
+ * / close). The row keeps the section header's height and quiet style — no
+ * separate strip is appended.
+ */
+function syncPageChipBatchBar() {
+  const count = selectedPageChipIds.size;
+  const section = document.getElementById('openTabsSection');
+  const header = section ? section.querySelector('.section-header') : null;
+  const titleEl = document.getElementById('openTabsSectionTitle');
+  const countEl = document.getElementById('openTabsSectionCount');
+  if (!section || !header || !titleEl || !countEl) return;
+  // The title carries the selection count while selected; announce the swap.
+  titleEl.setAttribute('aria-live', 'polite');
+  let bar = document.getElementById('pageChipBatchBar');
+  if (count === 0) {
+    section.classList.remove('has-chip-selection');
+    if (bar) bar.remove();
+    titleEl.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
+    countEl.style.display = '';
+    return;
+  }
+  section.classList.add('has-chip-selection');
+  titleEl.textContent = runtimeT ? runtimeT('batchSelectedCount', { count }) : `${count} selected`;
+  countEl.style.display = 'none';
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'pageChipBatchBar';
+    bar.className = 'page-chip-batch-bar';
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', runtimeT ? runtimeT('batchBarLabel') : 'Selected tabs');
+    bar.innerHTML = `
+      <button type="button" class="page-chip-batch-action" data-action="clear-chip-selection" aria-label="${runtimeT ? runtimeT('batchClearSelection') : 'Clear selection'}" data-tooltip="${runtimeT ? runtimeT('batchClearSelection') : 'Clear selection'}">${ICONS.deselect}</button>
+      <button type="button" class="page-chip-batch-action" data-action="batch-dedup-selection" aria-label="${runtimeT ? runtimeT('batchCloseDuplicates') : 'Close selected duplicates'}" data-tooltip="${runtimeT ? runtimeT('batchCloseDuplicates') : 'Close selected duplicates'}">${ICONS.closeDuplicates}</button>
+      <button type="button" class="page-chip-batch-action" data-action="batch-merge-chrome-group" aria-label="${runtimeT ? runtimeT('batchMergeChromeGroup') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('batchMergeChromeGroup') : 'Merge into Chrome group'}">${ICONS.mergeGroup}</button>
+      ${sleepControlEnabled ? `<button type="button" class="page-chip-batch-action" data-action="batch-discard-tabs" aria-label="${runtimeT ? runtimeT('batchSleepTabs') : 'Sleep selected'}" data-tooltip="${runtimeT ? runtimeT('batchSleepTabs') : 'Sleep selected'}">${ICONS.moon}</button>` : ''}
+      <button type="button" class="page-chip-batch-action" data-action="batch-save-session" aria-label="${runtimeT ? runtimeT('batchSaveSession') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('batchSaveSession') : 'Save session'}">${ICONS.archive}</button>
+      <button type="button" class="page-chip-batch-action" data-action="batch-close-tabs" aria-label="${runtimeT ? runtimeT('batchCloseTabs') : 'Close selected'}" data-tooltip="${runtimeT ? runtimeT('batchCloseTabs') : 'Close selected'}">${ICONS.close}</button>
+    `;
+    header.insertBefore(bar, countEl);
+  }
+}
+
+// Escape clears the highlight-only selection; a drag in flight is cancelled
+// first so it cannot commit a stale batch. Space on a focused reorder handle
+// is left to the native <button> activation (keyup → click), which already
+// suppresses page scrolling for buttons — preventing the keydown would cancel
+// that activation and break the keyboard toggle.
+let pageChipLastKeydownAt = 0;
+document.addEventListener('keydown', (e) => {
+  pageChipLastKeydownAt = Date.now();
+  if (e.key !== 'Escape') return;
+  // A commit is in flight: leave both the drag state and the selection alone.
+  // Clearing pageChipDragState mid-commit makes the commit read null after an
+  // await and leaves a half-applied move (C9).
+  if (pageChipCommitInFlight) return;
+  if (draggedPageChipId && pageChipDragState) {
+    clearPageChipDragState({ removeNode: false });
+  }
+  if (selectedPageChipIds.size > 0) {
+    clearPageChipSelection();
+  }
+});
+
 document.addEventListener('click', async (e) => {
   const actionEl = e.target.closest('[data-action]');
   if (!actionEl) return;
@@ -4277,7 +7155,16 @@ document.addEventListener('pointerdown', (e) => {
   const chipHandle = e.target.closest('[data-chip-drag-handle="tab"]');
   const chipItem = e.target.closest('[data-chip-sort-id]');
   const chipAction = e.target.closest('.chip-actions');
+  // The whole row is the drag surface — the handle is just the visible grip.
+  // A press that never moves is a click: the handle toggles the row in the
+  // selection, and the row body activates the tab (unless a multi-selection
+  // is active, in which case it toggles the row too). A press that moves
+  // drags the row (or the whole selection) no matter where it started; the
+  // click that follows a completed drag is suppressed in the pointerup path.
   if (chipItem && !chipAction && e.button === 0) {
+    // Re-entrancy guard: a second pointer must not clobber an in-flight drag
+    // (first drag would be silently lost and its capture never released).
+    if (pageChipDragState || draggedPageChipId) return;
     const item = chipItem;
     const listEl = item?.parentElement;
     const groupKey = item?.dataset.chipGroupId || '';
@@ -4300,12 +7187,16 @@ document.addEventListener('pointerdown', (e) => {
       createNewGroup: false,
       newGroupPlacement: '',
       handleEl: dragHandleEl,
+      // Handle presses toggle on click; body presses only toggle while a
+      // multi-selection is already active (otherwise the click jumps).
+      originatedFromHandle: Boolean(chipHandle),
       pointerId: e.pointerId,
       x: e.clientX,
       y: e.clientY,
       offsetX: e.clientX - rect.left,
       offsetY: e.clientY - rect.top,
       moved: false,
+      movingChipIds: getMovingPageChipIds(),
     };
     logPageChipDragDebug('pointerdown', {
       groupKey,
@@ -4313,6 +7204,7 @@ document.addEventListener('pointerdown', (e) => {
       x: Math.round(e.clientX),
       y: Math.round(e.clientY),
       pointerId: e.pointerId,
+      moving: pageChipDragState.movingChipIds.length,
     });
     if (typeof dragHandleEl.setPointerCapture === 'function' && e.pointerId != null) {
       try {
@@ -4355,8 +7247,11 @@ document.addEventListener('pointermove', (e) => {
     }
 
     if (pageChipDragState.moved) {
+      pageChipDragState.lastClientX = e.clientX;
+      pageChipDragState.lastClientY = e.clientY;
       updateDraggedPageChipPosition(e.clientX, e.clientY);
       previewPageChipOrder(e.clientX, e.clientY);
+      updatePageChipAutoScroll(e.clientX, e.clientY);
     }
     return;
   }
@@ -4387,12 +7282,44 @@ document.addEventListener('pointerup', async (e) => {
       pointerId: e.pointerId,
       moved: pageChipDragState.moved,
     });
+    // A press that never moved is a click, not a drag. The handle always
+    // toggles the row in the highlight-only selection (Shift extends the
+    // range from the anchor); the row body only toggles while a selection is
+    // already active — a plain body click stays a click so the synthesized
+    // click event can activate the tab.
+    const finalDistance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
+    if (!pageChipDragState.moved && finalDistance < 4) {
+      const toggleAsClick = pageChipDragState.originatedFromHandle
+        || selectedPageChipIds.size > 0
+        || e.shiftKey;
+      if (toggleAsClick) {
+        // Guard the synthesized click that follows on touch/pen devices so the
+        // row is not toggled twice.
+        pageChipPointerToggleGuard = { key: String(draggedPageChipId || ''), until: Date.now() + 400 };
+        if (e.shiftKey && pageChipSelectionAnchorId) {
+          selectPageChipRange(draggedPageChipId, pageChipSelectionAnchorId);
+        } else {
+          togglePageChipSelection(draggedPageChipId);
+        }
+      } else {
+        // No toggle happened, so there is no synthesized click to guard — a
+        // stale guard must not swallow the click that activates the tab.
+        pageChipPointerToggleGuard = { key: '', until: 0 };
+      }
+      clearPageChipDragState({ removeNode: false });
+      return;
+    }
     if (!pageChipDragState.moved) {
       const distance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
       if (distance >= 4) {
         startPageChipDragVisuals();
       }
     }
+    // A completed drag must not let the click that follows it activate the
+    // tab (the click lands on the row under the pointer). Suppress it here,
+    // synchronously, because the click is dispatched before the async commit
+    // inside finishPageChipDrag finishes.
+    suppressPageChipClickUntil = Date.now() + 250;
     updateDraggedPageChipPosition(e.clientX, e.clientY);
     const stickyTarget = pageChipDragState.lastResolvedDropTarget;
     const stickyIsNonSource = stickyTarget && (
@@ -4400,7 +7327,10 @@ document.addEventListener('pointerup', async (e) => {
       || (stickyTarget.kind === 'group' && stickyTarget.groupKey && stickyTarget.groupKey !== pageChipDragState.sourceGroupKey)
     );
     if (!stickyIsNonSource) {
-      syncPageChipDropTarget(e.clientX, e.clientY);
+      // Resolve the drop target and park the placeholder at the actual release
+      // point even when no pointermove preceded (fast flick), so the batch
+      // lands where the pointer was released instead of at the list end.
+      previewPageChipOrder(e.clientX, e.clientY);
     } else {
       logPageChipDragDebug('pointerup-keep-target', {
         kind: stickyTarget.kind,
@@ -4447,7 +7377,13 @@ document.addEventListener('pointerdown', (e) => {
   const button = e.target.closest('.group-nav-button[data-nav-kind="open-tabs"]');
   if (!button) return;
 
-  draggedGroupId = button.dataset.groupId || '';
+  const groupId = button.dataset.groupId || '';
+  // Chrome-group cards follow the native browser strip and are intentionally
+  // not persisted in the dashboard group order; do not start a drag that can
+  // never be saved (C18).
+  if (String(groupId).startsWith('__chrome_group__:')) return;
+
+  draggedGroupId = groupId;
   draggedGroupButtonEl = button;
   const rect = button.getBoundingClientRect();
   dragStartPoint = {
@@ -4511,6 +7447,17 @@ document.addEventListener('click', (e) => {
 
 // ---- Archive search — filter archived items as user types ----
 document.addEventListener('input', async (e) => {
+  const customSearchUrlInput = e.target.closest('[data-action="change-custom-search-url"]');
+  if (customSearchUrlInput) {
+    themePreferences = normalizeThemePreferences({
+      ...themePreferences,
+      customSearchUrl: customSearchUrlInput.value,
+    });
+    await chrome.storage.local.set({ [THEME_PREFERENCES_KEY]: themePreferences });
+    syncSearchPlaceholder();
+    return;
+  }
+
   if (e.target.id === 'themeTransparencyRange') {
     themePreferences = normalizeThemePreferences({
       ...themePreferences,
@@ -4640,8 +7587,24 @@ document.addEventListener('submit', async (e) => {
   if (e.target.id !== 'headerSearchForm') return;
 
   e.preventDefault();
+  // An IME-confirmation Enter (composition active) must not submit a search.
+  // The keydown handler blocks the default submit, but guard here too in case
+  // a browser still dispatches submit during composition.
+  if (searchSuggestionsIsComposing || e.isComposing) {
+    searchSubmitInFlight = false;
+    return;
+  }
+  // Enter was already handled by the input's keydown listener (which starts
+  // the navigation one event-loop turn earlier). A submit still fires as the
+  // form's default action; skip the duplicate run.
+  if (searchSubmitInFlight) {
+    searchSubmitInFlight = false;
+    return;
+  }
   const input = document.getElementById('headerSearchInput');
   const query = input?.value || '';
+  closeSearchSuggestions();
+  cancelSearchFocusRetryIfInteracting();
   await runDefaultSearch(query);
 });
 
@@ -4763,11 +7726,31 @@ async function initializeDashboardRuntime() {
     Date.now() + 2000
   );
   await loadThemePreferences();
+  syncSearchPlaceholder();
   sleepControlEnabled = (typeof themePreferences !== 'undefined' && themePreferences.sleepControlEnabled === true);
+
+  const navHost = getWorkspaceTopNavHost();
+  if (navHost && !navHost.dataset.wheelHijackAttached) {
+    navHost.dataset.wheelHijackAttached = '1';
+    // The nav scrollbars are hidden; let the vertical wheel scroll the
+    // group lists horizontally (delegated so it survives re-renders) — but
+    // only when the list can actually scroll, so a wheel over a short nav
+    // passes through instead of trapping the page.
+    navHost.addEventListener('wheel', (e) => {
+      const list = e.target.closest('.group-nav-list');
+      if (!list) return;
+      if (list.scrollWidth <= list.clientWidth) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        list.scrollLeft += e.deltaY;
+      }
+    }, { passive: false });
+  }
   if (typeof loadChromeTabGroupsSetting === 'function') {
     chromeTabGroupsEnabled = await loadChromeTabGroupsSetting();
   }
   await loadImportedChromeGroupMeta();
+  ensureSessionGroupTabReplacementSubscription();
   if (chromeTabGroupsEnabled) {
     await fetchOpenTabs();
     const realTabs = getRealTabs();
@@ -4783,8 +7766,50 @@ async function initializeDashboardRuntime() {
   await collapseChromeGroupsForCurrentTabHarborTab();
   updateBackToTopVisibility();
 
+  // Search-field auto-focus + inline suggestions.
+  const autoFocusEnabled = !(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled === false);
+  // Mirror the toggle into localStorage so focus-redirect.js (head-first,
+  // runs before chrome.storage is readable) sees the persisted value on every
+  // load — not only when the user toggles it here. '0' = off.
+  try {
+    localStorage.setItem('tabHarborAutoFocusSearch', autoFocusEnabled ? '1' : '0');
+  } catch { /* ignore */ }
+  setupSearchSuggestions();
+  if (autoFocusEnabled) {
+    focusSearchFieldOnForeground();
+    // Chrome focuses the omnibox shortly after a newtab page finishes loading,
+    // which can override the focus above. Re-claim the search field once the
+    // window has fully loaded.
+    if (document.readyState === 'complete') {
+      scheduleSearchFocusVerification();
+    } else {
+      window.addEventListener('load', scheduleSearchFocusVerification, { once: true });
+    }
+  }
+
   // Listen for tab change notifications from background script
   setupTabChangeListener();
+}
+
+/**
+ * isExtensionContextInvalidated(err)
+ *
+ * True when the extension was reloaded/updated/disabled while this page was
+ * still open: every chrome.* call then throws "Extension context invalidated".
+ * The page cannot do anything useful until it rebinds to a live context.
+ */
+function isExtensionContextInvalidated(err) {
+  return Boolean(err && /Extension context invalidated/i.test(String(err?.message || err)));
+}
+
+// Reload only once per invalidation — if the extension is disabled, the next
+// new-tab load falls back to the default page, so a single attempt cannot loop.
+let extensionContextInvalidatedHandled = false;
+function recoverFromInvalidatedExtensionContext() {
+  if (extensionContextInvalidatedHandled) return;
+  extensionContextInvalidatedHandled = true;
+  console.warn('[tab-harbor] Extension context invalidated — reloading dashboard to rebind.');
+  try { location.reload(); } catch { /* page may already be tearing down */ }
 }
 
 /**
@@ -4801,6 +7826,9 @@ function setupTabChangeListener() {
     if (DEBUG) console.log('[tab-harbor] Received message:', message);
 
     if (message.action === 'tabs-changed') {
+      if (message.source === 'tabs.onReplaced') {
+        void queueSessionGroupTabReplacementMigration(message.triggerTabId, message.replacedTabId);
+      }
       if (shouldSkipStartupTabChange(message)) {
         return;
       }
@@ -4823,6 +7851,9 @@ function setupTabChangeListener() {
           if (DEBUG) console.log('[tab-harbor] Refreshing dashboard...');
           await renderDashboard();
           updateBackToTopVisibility();
+          if (typeof window.__tabHarborSuggestionsRefresh === 'function') {
+            window.__tabHarborSuggestionsRefresh();
+          }
           if (DEBUG) console.log('[tab-harbor] Dashboard refreshed successfully');
         } catch (err) {
           // Extension was reloaded/updated — stop listening to avoid repeated errors
@@ -4831,6 +7862,7 @@ function setupTabChangeListener() {
             return;
           }
           console.warn('[tab-harbor] Failed to refresh dashboard:', err);
+          if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
         }
       }, 300); // Wait 300ms after last tab change
     }
@@ -4842,12 +7874,19 @@ function mountDashboardRuntime() {
   if (!window.__tabHarborRuntimeMounted) {
     document.addEventListener('pointerdown', disableEntryAnimations, { capture: true, passive: true });
     window.addEventListener('scroll', updateBackToTopVisibility, { passive: true });
+    // Any chrome.* call after the extension reloaded throws; a rejected promise
+    // from a user action would otherwise leave the page as a silent zombie.
+    window.addEventListener('unhandledrejection', (event) => {
+      if (isExtensionContextInvalidated(event?.reason)) recoverFromInvalidatedExtensionContext();
+    });
     window.addEventListener('focus', () => {
       void collapseChromeGroupsForCurrentTabHarborTab();
+      focusSearchFieldOnForeground();
     });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         void collapseChromeGroupsForCurrentTabHarborTab();
+        focusSearchFieldOnForeground();
       }
     });
     window.__tabHarborRuntimeMounted = true;

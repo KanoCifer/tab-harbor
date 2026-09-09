@@ -13,6 +13,7 @@
 
   const SAVED_TAB_SESSIONS_KEY = 'savedTabSessions';
   const MANUAL_GROUP_PREFIX = '__session_group__:';
+  const CHROME_GROUP_PREFIX = '__chrome_group__:';
 
   function createSessionId(now = new Date()) {
     return `tab-session-${now.getTime()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -105,6 +106,7 @@
       groupKey: normalizeString(input.groupKey),
       groupLabel: normalizeString(input.groupLabel),
       manualGroupId: normalizeString(input.manualGroupId),
+      chromeGroupColor: normalizeString(input.chromeGroupColor),
     };
   }
 
@@ -122,6 +124,7 @@
       key,
       label: normalizeString(input.label) || 'Group',
       manualGroupId: normalizeString(input.manualGroupId),
+      chromeGroupColor: normalizeString(input.chromeGroupColor),
       tabUrls: [...new Set(tabUrls)],
     };
   }
@@ -164,6 +167,7 @@
           key,
           label: normalizeString(tab?.groupLabel) || 'Group',
           manualGroupId: normalizeString(tab?.manualGroupId),
+          chromeGroupColor: normalizeString(tab?.chromeGroupColor),
           tabUrls: [],
         });
       }
@@ -243,6 +247,7 @@
       key,
       label: normalizeString(entry.label) || 'Group',
       manualGroupId: normalizeString(entry.manualGroupId),
+      chromeGroupColor: normalizeString(entry.chromeGroupColor),
     };
   }
 
@@ -279,6 +284,7 @@
         groupKey: lookupEntry?.key || '',
         groupLabel: lookupEntry?.label || '',
         manualGroupId: lookupEntry?.manualGroupId || '',
+        chromeGroupColor: lookupEntry?.chromeGroupColor || '',
       };
 
       savedTabs.push(savedTab);
@@ -289,6 +295,7 @@
             key: lookupEntry.key,
             label: lookupEntry.label,
             manualGroupId: lookupEntry.manualGroupId,
+            chromeGroupColor: lookupEntry.chromeGroupColor,
             tabUrls: [],
           });
         }
@@ -327,18 +334,37 @@
         ? { ...existingState.assignments }
         : {},
     };
+    const restoredBySourceIndex = new Map();
     const restoredByUrl = new Map();
-    for (const tab of Array.isArray(restoredTabs) ? restoredTabs : []) {
+    for (const [restoredIndex, tab] of (Array.isArray(restoredTabs) ? restoredTabs : []).entries()) {
       const canonicalUrl = sessionsGetCanonicalTabUrl ? sessionsGetCanonicalTabUrl(tab?.url || '') : normalizeString(tab?.url);
       if (!canonicalUrl || tab?.id == null) continue;
+      // Session restore creates tabs in saved-session order and carries that
+      // source index forward. That is the durable *instance* relationship:
+      // URLs can repeat in one group or in several different groups.
+      const sourceIndex = Number.isInteger(tab?.sourceIndex) ? tab.sourceIndex : restoredIndex;
+      restoredBySourceIndex.set(sourceIndex, String(tab.id));
       if (!restoredByUrl.has(canonicalUrl)) restoredByUrl.set(canonicalUrl, []);
       restoredByUrl.get(canonicalUrl).push(String(tab.id));
     }
 
+    // Native Chrome groups cannot be re-created here (no chrome.* access in
+    // this module) — return ordered plans for the caller to execute.
+    const chromeGroupPlans = [];
+
     const sessionGroups = Array.isArray(session?.groups) ? session.groups : [];
-    sessionGroups
-      .filter(group => normalizeString(group?.key).startsWith(MANUAL_GROUP_PREFIX))
-      .forEach((group, index) => {
+    const sessionTabs = Array.isArray(session?.tabs) ? session.tabs : [];
+    const restoredIdsByGroupKey = new Map();
+    for (const [sourceIndex, tabId] of restoredBySourceIndex.entries()) {
+      const groupKey = normalizeString(sessionTabs[sourceIndex]?.groupKey);
+      if (!groupKey) continue;
+      if (!restoredIdsByGroupKey.has(groupKey)) restoredIdsByGroupKey.set(groupKey, []);
+      restoredIdsByGroupKey.get(groupKey).push(tabId);
+    }
+
+    sessionGroups.forEach((group, index) => {
+      const groupKey = normalizeString(group?.key);
+      if (groupKey.startsWith(MANUAL_GROUP_PREFIX)) {
         const groupName = normalizeString(group.label) || 'Restored group';
         const groupId = `restored-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
         normalizedState.groups.push({
@@ -347,14 +373,47 @@
           createdAt: normalizeString(now) || new Date().toISOString(),
         });
 
-        for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
-          const tabIds = restoredByUrl.get(url) || [];
-          const tabId = tabIds.shift();
-          if (tabId) normalizedState.assignments[tabId] = groupId;
+        const instanceTabIds = restoredIdsByGroupKey.get(groupKey);
+        if (instanceTabIds) {
+          for (const tabId of instanceTabIds) normalizedState.assignments[tabId] = groupId;
+        } else {
+          // Legacy snapshots without per-tab groupKey retain the former
+          // best-effort URL fallback. New snapshots never take this path.
+          for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
+            const tabIds = restoredByUrl.get(url) || [];
+            const tabId = tabIds.shift();
+            if (tabId) normalizedState.assignments[tabId] = groupId;
+          }
         }
-      });
+      } else if (groupKey.startsWith(CHROME_GROUP_PREFIX)) {
+        // Restore as a fresh native Chrome group: title + color + the tab
+        // order recorded in tabUrls (the native group id is session-local and
+        // cannot be reused). Modern snapshots use their per-tab groupKey,
+        // preserving distinct same-URL instances; older snapshots fall back
+        // to the historical URL mapping below.
+        const instanceTabIds = restoredIdsByGroupKey.get(groupKey);
+        const planTabIds = instanceTabIds ? instanceTabIds.slice() : [];
+        if (!instanceTabIds) {
+          for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
+            const tabIds = restoredByUrl.get(url) || [];
+            if (tabIds.length) {
+              planTabIds.push(...tabIds);
+              restoredByUrl.set(url, []);
+            }
+          }
+        }
+        if (planTabIds.length > 0) {
+          chromeGroupPlans.push({
+            title: normalizeString(group.label) || 'Restored group',
+            color: normalizeString(group.chromeGroupColor) || 'grey',
+            tabIds: planTabIds,
+          });
+        }
+      }
+      // Domain keys (plain hostnames) are derived automatically on restore.
+    });
 
-    return normalizedState;
+    return { state: normalizedState, chromeGroupPlans };
   }
 
   async function getSavedTabSessions() {
