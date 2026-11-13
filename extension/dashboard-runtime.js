@@ -113,6 +113,7 @@ const {
 const {
   addSavedTabSession: runtimeAddSavedTabSession,
   appendSavedTabSessionTabs: runtimeAppendSavedTabSessionTabs,
+  updateSavedTabSessionTabs: runtimeUpdateSavedTabSessionTabs,
   buildSessionSnapshot: runtimeBuildSessionSnapshot,
   createRestoredSessionGroups: runtimeCreateRestoredSessionGroups,
   getSavedTabSessions: runtimeGetSavedTabSessions,
@@ -1954,6 +1955,39 @@ async function appendTabsToExistingSavedSession(sessionId, tabIds = []) {
   };
 }
 
+async function replaceTabsInExistingSavedSession(sessionId, tabIds = []) {
+  if (!runtimeBuildSessionSnapshot || !runtimeUpdateSavedTabSessionTabs) {
+    throw new Error('Session storage is unavailable');
+  }
+
+  const realTabs = await refreshTabSessionModel();
+  const selectedTabs = getTabsByIds(tabIds, realTabs);
+  const selectedIds = new Set((tabIds || []).map(String).filter(Boolean));
+  const snapshot = runtimeBuildSessionSnapshot({
+    tabs: selectedTabs,
+    groupLookup: getTabGroupLookup(),
+    selectedTabIds: [...selectedIds],
+    source: 'replace-existing',
+    now: new Date().toISOString(),
+  });
+
+  const sessions = await runtimeUpdateSavedTabSessionTabs(sessionId, snapshot.tabs);
+  const tabIdsToClose = selectedTabs
+    .filter(tab => selectedIds.has(String(tab?.id)) && (runtimeIsRestorableTabUrl ? runtimeIsRestorableTabUrl(tab?.url || '') : true))
+    .map(tab => getTabIdValue(tab?.id))
+    .filter(Number.isFinite);
+  const closeResult = await closeSavedSessionSourceTabs(tabIdsToClose);
+
+  return {
+    sessions,
+    session: sessions.find(session => String(session?.id || '') === String(sessionId || '')) || null,
+    selectedCount: snapshot.tabs.length,
+    closedCount: closeResult.closedCount,
+    closedTabIds: [...closeResult.closedTabIds],
+    closeError: closeResult.closeError,
+  };
+}
+
 async function submitTodoEditor() {
   const editorState = getTodoEditorState ? getTodoEditorState() : {};
   const title = String(editorState.title || '').trim();
@@ -2062,7 +2096,9 @@ async function openTabSessionPicker({
     : allIds;
   tabSessionPickerState = {
     open: true,
-    mode: tabSessionPickerState.mode === 'existing' && savedSessions.length ? 'existing' : 'new',
+    mode: ['existing', 'replace'].includes(tabSessionPickerState.mode) && savedSessions.length
+      ? tabSessionPickerState.mode
+      : 'new',
     source,
     selectedTabIds: initialSelectedIds,
     newSessionName: tabSessionPickerState.newSessionName || '',
@@ -2098,7 +2134,7 @@ function renderTabSessionPicker(groups = tabSessionPickerState.groups) {
   const selectedIds = new Set(getTabSessionPickerSelectedIds());
   const selectedCount = selectedIds.size;
   const existingDisabled = savedSessions.length === 0;
-  const mode = tabSessionPickerState.mode === 'existing' && !existingDisabled ? 'existing' : 'new';
+  const mode = ['existing', 'replace'].includes(tabSessionPickerState.mode) && !existingDisabled ? tabSessionPickerState.mode : 'new';
   const targetSessionId = tabSessionPickerState.targetSessionId || String(savedSessions[0]?.id || '');
   const safeTargetSessionId = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(targetSessionId) : targetSessionId.replace(/"/g, '&quot;');
   const safeSelectLabel = runtimeEscapeHtmlAttribute
@@ -2175,10 +2211,11 @@ function renderTabSessionPicker(groups = tabSessionPickerState.groups) {
         <span class="session-picker-count">${runtimeT ? runtimeT('sessionPickerSelectedCount', { count: selectedCount }) : `${selectedCount} selected`}</span>
         <div class="session-picker-save-mode" role="group" aria-label="${runtimeT ? runtimeT('sessionPickerModeLabel') : 'Save mode'}">
           <button class="session-picker-mode-button${mode === 'new' ? ' is-active' : ''}" type="button" data-action="select-session-picker-mode" data-session-picker-mode="new" aria-pressed="${mode === 'new'}">${runtimeT ? runtimeT('sessionPickerNewSession') : 'New group'}</button>
-          <button class="session-picker-mode-button${mode === 'existing' ? ' is-active' : ''}" type="button" data-action="select-session-picker-mode" data-session-picker-mode="existing" aria-pressed="${mode === 'existing'}"${existingDisabled ? ' disabled' : ''}>${runtimeT ? runtimeT('sessionPickerExistingSession') : 'Existing group'}</button>
+          <button class="session-picker-mode-button${mode === 'existing' ? ' is-active' : ''}" type="button" data-action="select-session-picker-mode" data-session-picker-mode="existing" aria-pressed="${mode === 'existing'}"${existingDisabled ? ' disabled' : ''}>${runtimeT ? runtimeT('sessionPickerExistingSession') : 'Join existing group'}</button>
+          <button class="session-picker-mode-button${mode === 'replace' ? ' is-active' : ''}" type="button" data-action="select-session-picker-mode" data-session-picker-mode="replace" aria-pressed="${mode === 'replace'}"${existingDisabled ? ' disabled' : ''}>${runtimeT ? runtimeT('sessionPickerReplaceSession') : 'Replace group'}</button>
         </div>
         <input class="session-picker-name-input" type="text" data-action="change-session-picker-new-name" value="${safeNewSessionName}" placeholder="${safeNamePlaceholder}" aria-label="${safeNamePlaceholder}"${mode === 'new' ? '' : ' hidden disabled'}>
-        <select class="session-picker-target-select" data-action="change-session-picker-target" aria-label="${safeSelectLabel}"${mode === 'existing' && !existingDisabled ? '' : ' hidden disabled'}>
+        <select class="session-picker-target-select" data-action="change-session-picker-target" aria-label="${safeSelectLabel}"${['existing', 'replace'].includes(mode) && !existingDisabled ? '' : ' hidden disabled'}>
           ${savedSessions.length
             ? savedSessions.map(session => {
               const id = String(session?.id || '');
@@ -2189,7 +2226,9 @@ function renderTabSessionPicker(groups = tabSessionPickerState.groups) {
             : `<option value="">${runtimeT ? runtimeT('sessionPickerNoSavedSessions') : 'No saved sessions yet'}</option>`}
         </select>
         <button class="action-btn save-tabs" type="button" data-action="save-selected-session-tabs"${selectedCount ? '' : ' disabled'}>
-          ${mode === 'existing'
+          ${mode === 'replace'
+            ? (runtimeT ? runtimeT('sessionPickerReplaceExisting') : 'Replace group')
+            : mode === 'existing'
             ? (runtimeT ? runtimeT('sessionPickerAddToExisting') : 'Add to session')
             : (runtimeT ? runtimeT('sessionPickerSaveAndClose') : 'Save and close')}
         </button>
@@ -2205,10 +2244,12 @@ async function submitTabSessionPicker() {
   }
 
   try {
-    if (tabSessionPickerState.mode === 'existing') {
+    if (tabSessionPickerState.mode === 'existing' || tabSessionPickerState.mode === 'replace') {
       const targetSessionId = tabSessionPickerState.targetSessionId || String(tabSessionPickerState.savedSessions?.[0]?.id || '');
       if (!targetSessionId) throw new Error('Session not found');
-      const result = await appendTabsToExistingSavedSession(targetSessionId, selectedIds);
+      const result = tabSessionPickerState.mode === 'replace'
+        ? await replaceTabsInExistingSavedSession(targetSessionId, selectedIds)
+        : await appendTabsToExistingSavedSession(targetSessionId, selectedIds);
       tabSessionPickerState = {
         ...tabSessionPickerState,
         open: false,
@@ -2217,9 +2258,15 @@ async function submitTabSessionPicker() {
       await renderDashboard();
       const skipped = result?.skippedDuplicateCount || 0;
       const closedCount = result?.closedCount || 0;
-      showToast(runtimeT
-        ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, closedCount, skipped })
-        : `Added ${result?.appendedCount || 0} tabs; closed ${closedCount} originals${skipped ? `, skipped ${skipped} duplicates` : ''}`);
+      if (tabSessionPickerState.mode === 'replace') {
+        showToast(runtimeT
+          ? runtimeT('toastSessionReplaced', { count: result?.selectedCount || 0, closedCount })
+          : `Replaced group with ${result?.selectedCount || 0} tabs; closed ${closedCount} originals`);
+      } else {
+        showToast(runtimeT
+          ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, closedCount, skipped })
+          : `Added ${result?.appendedCount || 0} tabs; closed ${closedCount} originals${skipped ? `, skipped ${skipped} duplicates` : ''}`);
+      }
       return;
     }
 
@@ -2420,6 +2467,11 @@ async function restoreSavedTabSession(sessionId) {
 
     await saveSessionGroups(nextSessionGroups);
     await renderDashboard();
+
+    // Close the originating new tab only after the restored workspace is saved.
+    if (restoredTabs.length > 0) {
+      await closeDashboardAfterTabFocus(restoredTabs[0].id);
+    }
 
     return {
       restoredCount: restoredTabs.length,
@@ -3627,6 +3679,16 @@ function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
  * matched (exact match first, then hostname fallback). Also brings the
  * window to the front.
  */
+async function closeDashboardAfterTabFocus(targetTabId) {
+  if (currentDashboardTabId == null || currentDashboardTabId === targetTabId) return;
+  try {
+    const dashboardTab = await chrome.tabs.get(currentDashboardTabId);
+    if (isTabHarborNewTabUrl(dashboardTab.url || '')) {
+      await chrome.tabs.remove(dashboardTab.id);
+    }
+  } catch { /* Closing the dashboard must not undo a successful tab switch. */ }
+}
+
 async function focusTab(url, tabId = null) {
   if (!url && !tabId) return;
   const numericTabId = getTabIdValue(tabId);
@@ -3639,6 +3701,7 @@ async function focusTab(url, tabId = null) {
         if (typeof syncChromeTabGroupExpansionForTab === 'function') {
           await syncChromeTabGroupExpansionForTab(targetTab);
         }
+        await closeDashboardAfterTabFocus(targetTab.id);
         return true;
       }
     } catch { /* fall back to URL matching */ }
@@ -3669,6 +3732,7 @@ async function focusTab(url, tabId = null) {
   if (typeof syncChromeTabGroupExpansionForTab === 'function') {
     await syncChromeTabGroupExpansionForTab(match);
   }
+  await closeDashboardAfterTabFocus(match.id);
   return true;
 }
 
@@ -4666,6 +4730,18 @@ function getRealTabs() {
 }
 
 
+/**
+ * updateOpenTabsStat(realTabs)
+ *
+ * Footer "open tabs" count. Counts the same tabs the cards list, so Tab
+ * Harbor's own page and other browser-internal pages are not included.
+ */
+function updateOpenTabsStat(realTabs = getRealTabs()) {
+  const statTabs = document.getElementById('statTabs');
+  if (statTabs) statTabs.textContent = realTabs.length;
+}
+
+
 /* ----------------------------------------------------------------
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
@@ -4773,14 +4849,14 @@ function renderDomainCard(group) {
   const totalExtras = dupeUrls.reduce((s, [, c]) => s + c - 1, 0);
 
   const dupeBadge = hasDupes
-    ? `<span class="duplicate-count-badge">
+    ? `<button class="duplicate-count-action" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrls.map(([url]) => encodeURIComponent(url)).join(',')}" aria-label="${runtimeT ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' }) : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`}">
         ${runtimeT
-          ? runtimeT('duplicatesCount', {
+          ? runtimeT('closedDuplicatesCount', {
               count: totalExtras,
               suffix: totalExtras !== 1 ? 's' : '',
             })
-          : `${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`}
-      </span>`
+          : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`}
+      </button>`
     : '';
 
   const orderedTabs = getOrderedUniqueTabsForGroup(group);
@@ -4812,7 +4888,6 @@ function renderDomainCard(group) {
         ${ICONS.close}
       </button>`;
 
-  const dupeUrlsEncoded = hasDupes ? dupeUrls.map(([url]) => encodeURIComponent(url)).join(',') : '';
   // Header actions, left to right: close duplicates, merge into a Chrome
   // group, sleep all in group, save session, close group. All are icon
   // buttons in the same quiet header style (30×30, muted → ink on hover).
@@ -4821,13 +4896,10 @@ function renderDomainCard(group) {
     <button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}">
       ${ICONS.mergeGroup}
     </button>`;
-  const dedupLabel = runtimeT
-    ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
-    : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`;
-  const dedupButton = hasDupes ? `
-    <button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" aria-label="${dedupLabel}" data-tooltip="${dedupLabel}">
-      ${ICONS.closeDuplicates}
-    </button>` : '';
+  // Duplicate cleanup is the single visible text action beside the group
+  // title. Keep the action out of the icon-only header controls so the count
+  // and consequence are clear without relying on a tooltip.
+  const dedupButton = '';
 
   // Chrome tab group colors: named enum colors map to dashboard accents, and
   // Chrome 132+ custom colors come back as raw hex (#rrggbb) — pass those
@@ -5559,8 +5631,7 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
     if (openTabsSectionCount) openTabsSectionCount.textContent = runtimeT ? runtimeT('emptyTabsCount') : '0 domains';
   }
 
-  const statTabs = document.getElementById('statTabs');
-  if (statTabs) statTabs.textContent = openTabs.length;
+  updateOpenTabsStat(realTabs);
 
   if (groupRenameEditorState?.shouldFocus) {
     const focusKey = String(groupRenameEditorState.groupKey || '');
@@ -5964,7 +6035,8 @@ document.addEventListener('click', async (e) => {
 
   if (action === 'select-session-picker-mode') {
     e.preventDefault();
-    const nextMode = actionEl.dataset.sessionPickerMode === 'existing' ? 'existing' : 'new';
+    const requestedMode = actionEl.dataset.sessionPickerMode || 'new';
+    const nextMode = ['existing', 'replace'].includes(requestedMode) ? requestedMode : 'new';
     if (nextMode === 'existing' && !tabSessionPickerState.savedSessions?.length) return;
     tabSessionPickerState = {
       ...tabSessionPickerState,
@@ -6151,8 +6223,7 @@ document.addEventListener('click', async (e) => {
     }
 
     // Update footer
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
+    updateOpenTabsStat();
 
     showToast(runtimeT ? runtimeT('toastTabClosed') : 'Tab closed');
     return;
@@ -6449,8 +6520,7 @@ document.addEventListener('click', async (e) => {
         ? runtimeT('closedTabsFromGroup', { count: closedCount, tabsWord, groupLabel })
         : `Closed ${closedCount} ${tabsWord} from ${groupLabel}`);
 
-      const statTabs = document.getElementById('statTabs');
-      if (statTabs) statTabs.textContent = openTabs.length;
+      updateOpenTabsStat();
       return;
     } finally {
       // A rejected close/query/render must not strand the event-driven tab

@@ -798,12 +798,12 @@ test('sleeping a stale (ghost) chip re-renders instead of silently corrupting gr
   assert.match(runtimeJs, /} else if \(stale > 0\) \{\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\) : 'Tab already closed'\);/);
 });
 
-test('close-duplicates and merge-group are header icon actions left of the sleep action', () => {
-  assert.match(runtimeJs, /const dedupButton = hasDupes \? `\s*<button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="\$\{dupeUrlsEncoded\}" aria-label="\$\{dedupLabel\}" data-tooltip="\$\{dedupLabel\}">/);
+test('duplicate cleanup is one visible text button beside the group title', () => {
+  assert.match(runtimeJs, /const dupeBadge = hasDupes\s+\? `<button class="duplicate-count-action" type="button" data-action="dedup-keep-one"/);
+  assert.match(runtimeJs, /const dedupButton = '';/);
   // The merge action is hidden on cards that already ARE a Chrome group.
   assert.match(runtimeJs, /const mergeGroupButton = group\.isChromeGroup \? '' : `\s*<button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="\$\{stableId\}" aria-label="\$\{runtimeT \? runtimeT\('groupCardTabsLabel'\)/);
-  // Close-duplicates sits leftmost, then merge, then the sleep icon. The
-  // sleep icon is gated on there being anything left to sleep in the card.
+  // The icon-only header controls keep merge before the optional sleep action.
   assert.match(runtimeJs, /<div class="mission-actions">\s*\$\{dedupButton\}\s*\$\{mergeGroupButton\}\s*\$\{sleepControlEnabled && hasSleepableTabs \? `/);
   // Chrome group cards carry their native group id and color for the bar.
   assert.match(runtimeJs, /class="mission-card domain-card \$\{hasDupes \? 'has-amber-bar' : 'has-neutral-bar'\}\$\{group\.isChromeGroup \? ' chrome-group-card' : ''\}"[\s\S]{0,200}data-chrome-group-id="\$\{group\.chromeGroupId\}"[\s\S]{0,120}--chrome-group-color:\$\{chromeColor\}/);
@@ -1654,6 +1654,7 @@ test('restoreSavedTabSession sleeps restored background tabs only after Chrome g
     let sessionGroupsState = { groups: [], assignments: {} };
     async function saveSessionGroups() { calls.push('save'); }
     async function renderDashboard() { calls.push('render'); }
+    async function closeDashboardAfterTabFocus(tabId) { calls.push('close-dashboard:' + tabId); }
     async function runWithSuppressedRefresh(task) { return task(); }
     function discardRestoredTabAfterCommit(tabId) { calls.push('discard:' + tabId); }
     function muteChromeGroupEvents() {}
@@ -1703,6 +1704,7 @@ test('restoreSavedTabSession sleeps restored background tabs only after Chrome g
       'discard:3003',
       'save',
       'render',
+      'close-dashboard:3001',
     ]);
   } finally {
     delete globalThis.chrome;
@@ -1941,5 +1943,107 @@ test('restoreChromeGroupsForSession reports a metadata half-success without aban
     delete globalThis.muteChromeGroupEvents;
     delete globalThis.reorderGroupedTabs;
     delete globalThis.chrome;
+  }
+});
+
+// @lat: [[tab-navigation#Close the dashboard after switching]]
+test('focusTab closes only its dashboard after a successful switch', async () => {
+  for (const mode of ['id', 'url', 'missing', 'failed', 'navigated', 'self', 'close-failed', 'uncached']) {
+    const calls = [];
+    const target = { id: mode === 'self' ? 90 : 42, windowId: 7, url: 'https://example.com/' };
+    const chrome = {
+      tabs: {
+        get: async id => {
+          if (id === 90) return { id, url: mode === 'navigated' ? 'https://other.example/' : 'chrome://newtab/' };
+          return target;
+        },
+        update: async id => {
+          calls.push(['activate', id]);
+          if (mode === 'failed') throw new Error('activation failed');
+        },
+        remove: async id => {
+          calls.push(['remove', id]);
+          if (mode === 'close-failed') throw new Error('already closed');
+        },
+      },
+      windows: { update: async id => calls.push(['focus-window', id]) },
+    };
+    const focus = new Function('chrome', 'currentDashboardTabId', `
+      const getTabIdValue = value => value == null ? null : Number(value);
+      const queryTabsForDashboardWindow = async () => ${mode === 'missing' ? '[]' : '[{ id: 42, windowId: 7, url: "https://example.com/" }]'};
+      const runtimeGetCanonicalTabUrl = null;
+      const getTabCanonicalUrl = tab => tab.url;
+      const syncChromeTabGroupExpansionForTab = async () => {};
+      const isTabHarborNewTabUrl = url => url === 'chrome://newtab/';
+      ${extractFn(runtimeJs, 'closeDashboardAfterTabFocus')}
+      ${extractFn(runtimeJs, 'focusTab')}
+      return focusTab;
+    `)(chrome, mode === 'uncached' ? null : 90);
+    const result = focus('https://example.com/', ['url', 'missing'].includes(mode) ? null : target.id);
+    if (mode === 'failed') {
+      await assert.rejects(result, /activation failed/);
+    } else {
+      assert.equal(await result, mode !== 'missing');
+    }
+    const shouldClose = ['id', 'url', 'close-failed'].includes(mode);
+    assert.deepEqual(calls.filter(call => call[0] === 'remove'), shouldClose ? [['remove', 90]] : [], mode);
+    if (shouldClose) assert.deepEqual(calls.slice(0, 2), [['activate', 42], ['focus-window', 7]]);
+  }
+});
+
+// @lat: [[tab-navigation#Close the dashboard after restoring a saved session]]
+test('saved session restore closes its originating dashboard only after success in either restore mode', async () => {
+  for (const restoreMode of ['current-window', 'new-window']) {
+    for (const scenario of ['success', 'failed', 'save-failed', 'empty', 'navigated', 'close-failed']) {
+      const calls = [];
+      const chrome = {
+        tabs: {
+          get: async id => ({ id, url: scenario === 'navigated' ? 'https://other.example/' : 'chrome://newtab/' }),
+          remove: async id => {
+            calls.push(['remove', id]);
+            if (scenario === 'close-failed') throw new Error('already closed');
+          },
+        },
+      };
+      const restore = new Function('chrome', 'restoreMode', 'scenario', 'calls', `
+        const currentDashboardTabId = 90;
+        const isTabHarborNewTabUrl = url => url === 'chrome://newtab/';
+        const runtimeGetSavedTabSessions = async () => [{ id: 'saved', tabs: [{ url: 'https://example.com/' }] }];
+        const runtimeGetSavedSessionRestoreMode = () => restoreMode;
+        const runtimeCreateRestoredSessionGroups = () => ({ state: {}, chromeGroupPlans: [] });
+        const sessionGroupsState = {};
+        const runWithSuppressedRefresh = task => task();
+        const open = async mode => {
+          calls.push(['open', mode]);
+          if (scenario === 'failed') throw new Error('restore failed');
+          return { restoredTabs: scenario === 'empty' ? [] : [{ id: 42 }], windowId: 7, backgroundTabDiscards: [] };
+        };
+        const openSavedTabsInCurrentWindow = () => open('current-window');
+        const openSavedTabsInNewWindow = () => open('new-window');
+        const restoreChromeGroupsForSession = async () => { calls.push(['groups']); return {}; };
+        const scheduleRestoredSessionBackgroundDiscards = () => {};
+        const saveSessionGroups = async () => {
+          calls.push(['save']);
+          if (scenario === 'save-failed') throw new Error('save failed');
+        };
+        const renderDashboard = async () => { calls.push(['render']); };
+        ${extractFn(runtimeJs, 'closeDashboardAfterTabFocus')}
+        ${extractFn(runtimeJs, 'restoreSavedTabSession')}
+        return restoreSavedTabSession;
+      `)(chrome, restoreMode, scenario, calls);
+
+      if (['failed', 'save-failed'].includes(scenario)) {
+        await assert.rejects(restore('saved'), /failed/);
+      } else {
+        const result = await restore('saved');
+        assert.equal(result.restoredCount, scenario === 'empty' ? 0 : 1);
+      }
+      assert.deepEqual(calls[0], ['open', restoreMode]);
+      const shouldClose = ['success', 'close-failed'].includes(scenario);
+      assert.deepEqual(calls.filter(call => call[0] === 'remove'), shouldClose ? [['remove', 90]] : [], `${restoreMode}: ${scenario}`);
+      if (shouldClose) {
+        assert.deepEqual(calls.slice(-3), [['save'], ['render'], ['remove', 90]]);
+      }
+    }
   }
 });

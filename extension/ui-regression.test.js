@@ -9,7 +9,8 @@ const appEntryJs = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const backgroundJs = fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8');
 const chromeImportJs = fs.readFileSync(path.join(__dirname, 'chrome-tab-groups-import.js'), 'utf8');
 const runtimeJs = fs.readFileSync(path.join(__dirname, 'dashboard-runtime.js'), 'utf8');
-const themeJs = fs.readFileSync(path.join(__dirname, 'theme-controls.js'), 'utf8');
+const themeJs = ['theme-palettes.js', 'theme-controls.js']
+  .map(file => fs.readFileSync(path.join(__dirname, file), 'utf8')).join('\n');
 const drawerJs = fs.readFileSync(path.join(__dirname, 'drawer-manager.js'), 'utf8');
 const helperJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
 const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
@@ -61,6 +62,9 @@ test('saved tabs page keeps session management while home owns session save acti
   assert.match(runtimeJs, /data-action="save-current-window-session"/);
   assert.match(runtimeJs, /id="tabSessionPicker"/);
   assert.match(runtimeJs, /data-action="select-session-picker-mode"[\s\S]*data-session-picker-mode="existing"/);
+  assert.match(runtimeJs, /data-session-picker-mode="replace"/);
+  assert.match(runtimeJs, /async function replaceTabsInExistingSavedSession\(sessionId, tabIds = \[\]\)/);
+  assert.match(runtimeJs, /runtimeUpdateSavedTabSessionTabs\(sessionId, snapshot\.tabs\)/);
   assert.match(runtimeJs, /data-action="change-session-picker-new-name"/);
   assert.match(runtimeJs, /sessionPickerNewSessionNamePlaceholder/);
   assert.match(runtimeJs, /data-action="change-session-picker-target"/);
@@ -658,7 +662,7 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.tab-cleanup-banner\s*\{[\s\S]*border-radius:\s*999px;[\s\S]*flex:\s*0 0 auto;/);
   assert.match(css, /\.tab-cleanup-btn\s*\{[\s\S]*border-radius:\s*999px;/);
   assert.match(css, /\.tab-cleanup-btn:hover\s*\{[\s\S]*background:\s*var\(--banner-action-bg-hover\);/);
-  assert.match(css, /\.duplicate-count-badge\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border:\s*1px solid var\(--workspace-chip-border\);/);
+  assert.match(css, /\.duplicate-count-action\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border:\s*1px solid var\(--workspace-chip-border\);/);
   assert.match(css, /\.action-btn\.close-tabs\s*\{[\s\S]*border-color:\s*var\(--workspace-chip-border\);[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--workspace-chip-bg\)\s+92%,\s*var\(--card-bg\)\s+8%\s*\);[\s\S]*border-radius:\s*8px;[\s\S]*min-height:\s*28px;/);
   assert.match(css, /\.action-btn\.close-tabs:hover\s*\{[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border-color:\s*var\(--workspace-accent-border\);/);
   assert.match(css, /\.deferred-shell\s*\{[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--card-bg\)\s+var\(--panel-card-opacity\),\s*transparent\s*\);/);
@@ -1545,3 +1549,10 @@ test('hitokoto uses cached text and refreshes in the background without blocking
   assert.doesNotMatch(renderStaticDashboardBody, /await fetchHitokoto/);
   assert.doesNotMatch(renderStaticDashboardBody, /refreshHitokotoInBackground/);
 });
+
+test('footer open-tabs count matches the listed tabs, excluding Tab Harbor and browser pages', () => {
+  assert.match(runtimeJs, /function updateOpenTabsStat\(realTabs = getRealTabs\(\)\) \{[\s\S]*?statTabs\.textContent = realTabs\.length;/);
+  assert.match(runtimeJs, /function renderOpenTabsArea\(realTabs = getRealTabs\(\)\) \{[\s\S]*?updateOpenTabsStat\(realTabs\);/);
+  assert.doesNotMatch(runtimeJs, /statTabs\.textContent = openTabs\.length/);
+});
+
